@@ -12,5 +12,5 @@ The recovery base was tested on Xiaomi Pad 5 (nabu) running
 - Recovery/image/installer/UI host tests and host/Android Clippy checks passed.
 - The published patch applies to the pinned upstream commit, the bootstrap can run repeatedly on that checkout, and its reconstructed source passed the relevant host tests.
 
-Permanent boot partition writes have not been exercised on the tablet.
+The bundled installer saved the original boot backup, wrote the current boot_a partition and verified its contents by reading it back on the tablet. Saved brightness and automatic unencrypted-data mounting were also confirmed after a fresh recovery start.
 Credential-based FBE decryption remains unverified because the tested ROM disables encryption.
