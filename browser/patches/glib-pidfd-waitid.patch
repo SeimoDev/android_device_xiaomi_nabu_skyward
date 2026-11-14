@@ -1,0 +1,15 @@
+--- a/glib/gmain.c
++++ b/glib/gmain.c
+@@ -6349,6 +6349,12 @@
+                 return TRUE;
+               }
+           }
++        else if (errno == EINVAL)
++          {
++            /* Some Android kernels backport pollable pidfds without
++             * waitid(P_PIDFD). Reap with the existing waitpid path below.
++             */
++          }
+         else
+           {
+             int errsv = errno;

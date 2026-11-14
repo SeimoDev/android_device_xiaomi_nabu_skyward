@@ -1,8 +1,17 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ee5530e..b948a6f 100644
+index ee5530e..be0ce9a 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -2437,8 +2437,10 @@ dependencies = [
+@@ -2370,6 +2370,8 @@ dependencies = [
+  "hex",
+  "libc",
+  "procfs",
++ "serde",
++ "serde_json",
+  "skyward-backup",
+  "skyward-binder",
+  "skyward-block",
+@@ -2437,8 +2439,10 @@ dependencies = [
   "abootimg-oxide",
   "anyhow",
   "cpio",
@@ -13,7 +22,7 @@ index ee5530e..b948a6f 100644
   "tempfile",
  ]
  
-@@ -2597,6 +2599,7 @@ dependencies = [
+@@ -2597,6 +2601,7 @@ dependencies = [
   "skyward-programs",
   "tempfile",
   "unpayload",
@@ -726,6 +735,556 @@ index 213f214..76eec16 100644
  pub mod commands;
  pub mod fuse;
  pub mod image;
+diff --git a/crates/skyward-net/Cargo.toml b/crates/skyward-net/Cargo.toml
+index ccd2a6d..7c21ba7 100644
+--- a/crates/skyward-net/Cargo.toml
++++ b/crates/skyward-net/Cargo.toml
+@@ -22,4 +22,4 @@ sha2 = "0.10.9"
+ skyward-block = { path = "../skyward-block" }
+ # The resolver ureq takes is under its unversioned API, which may change
+ # between any two releases.
+-ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
++ureq = { version = "=3.5.0", default-features = false, features = ["rustls", "socks-proxy"] }
+diff --git a/crates/skyward-net/src/dns.rs b/crates/skyward-net/src/dns.rs
+index 8db3516..c05cd93 100644
+--- a/crates/skyward-net/src/dns.rs
++++ b/crates/skyward-net/src/dns.rs
+@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
+ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+ use hickory_proto::rr::{Name, RData, RecordType};
+ use std::io::{Read, Write};
+-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
++use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+ use std::time::Duration;
+ 
+ const PORT: u16 = 53;
+@@ -73,26 +73,28 @@ fn id() -> u16 {
+ }
+ 
+ /// The IPv4 addresses of `host`, asked of `servers` in turn.
+-pub fn lookup(host: &str, servers: &[Ipv4Addr]) -> Result<Vec<Ipv4Addr>> {
++pub fn lookup(host: &str, servers: &[IpAddr]) -> Result<Vec<Ipv4Addr>> {
+     if let Ok(address) = host.parse::<Ipv4Addr>() {
+         return Ok(vec![address]);
+     }
+-    let servers: Vec<SocketAddrV4> = servers.iter().map(|server| SocketAddrV4::new(*server, PORT)).collect();
++    let servers: Vec<SocketAddr> = servers.iter().map(|server| SocketAddr::new(*server, PORT)).collect();
+     ask_in_turn(host, &servers)
+ }
+ 
+ /// The IPv4 addresses of `host`, asked of the servers at `servers` one
+ /// after another until one gives them; where none does, why the last did
+ /// not.
+-fn ask_in_turn(host: &str, servers: &[SocketAddrV4]) -> Result<Vec<Ipv4Addr>> {
++fn ask_in_turn<T: Copy + Into<SocketAddr>>(host: &str, servers: &[T]) -> Result<Vec<Ipv4Addr>> {
+     if servers.is_empty() {
+         bail!("the network gave no DNS server");
+     }
+     let mut last = None;
+     for server in servers {
+-        match ask_server(host, *server)? {
+-            Ok(found) => return Ok(found),
+-            Err(why) => last = Some(why),
++        match ask_server(host, *server) {
++            Ok(Ok(found)) => return Ok(found),
++            Ok(Err(why)) => last = Some(why),
++            Err(why) if why.is::<std::io::Error>() => last = Some(why),
++            Err(why) => return Err(why),
+         }
+     }
+     Err(last.expect("there was a server to ask"))
+@@ -104,7 +106,8 @@ fn ask_in_turn(host: &str, servers: &[SocketAddrV4]) -> Result<Vec<Ipv4Addr>> {
+ /// none, which is for the next server to be asked: it did not answer, or
+ /// answered that it could not or would not look the name up. A name that
+ /// is not there is an error, as it is not there at the next server either.
+-fn ask_server(host: &str, at: SocketAddrV4) -> Result<Result<Vec<Ipv4Addr>, anyhow::Error>> {
++fn ask_server(host: &str, at: impl Into<SocketAddr>) -> Result<Result<Vec<Ipv4Addr>, anyhow::Error>> {
++    let at = at.into();
+     let unanswered = |code: ResponseCode| anyhow::anyhow!("the DNS server at {} answered {code} for {host}", at.ip());
+     match ask(host, at)? {
+         Some(Answer::Addresses(found)) => return Ok(Ok(found)),
+@@ -120,10 +123,12 @@ fn ask_server(host: &str, at: SocketAddrV4) -> Result<Result<Vec<Ipv4Addr>, anyh
+ }
+ 
+ /// Ask the server at `at` over UDP; nothing heard in time gives none.
+-fn ask(host: &str, at: SocketAddrV4) -> Result<Option<Answer>> {
++fn ask(host: &str, at: impl Into<SocketAddr>) -> Result<Option<Answer>> {
++    let at = at.into();
+     let id = id();
+     let q = question(id, host)?;
+-    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("make a DNS socket")?;
++    let bind = if at.is_ipv4() { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V6(Ipv6Addr::UNSPECIFIED) };
++    let s = UdpSocket::bind((bind, 0)).context("make a DNS socket")?;
+     s.set_read_timeout(Some(WAIT)).context("time the DNS socket")?;
+     s.send_to(&q, at).with_context(|| format!("ask the DNS server at {at}"))?;
+     let mut buf = [0u8; 1500];
+@@ -134,7 +139,7 @@ fn ask(host: &str, at: SocketAddrV4) -> Result<Option<Answer>> {
+             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+             Err(e) => return Err(e).with_context(|| format!("read the answer of the DNS server at {at}")),
+         };
+-        if from != SocketAddr::V4(at) {
++        if from != at {
+             continue;
+         }
+         if let Some(answer) = answer(&buf[..n], id, host)? {
+@@ -146,11 +151,12 @@ fn ask(host: &str, at: SocketAddrV4) -> Result<Option<Answer>> {
+ /// Ask the server at `at` over TCP, where each message goes after its
+ /// length in two bytes: its answer for `host`, or why the server could not
+ /// be asked or its answer read.
+-fn ask_tcp(host: &str, at: SocketAddrV4) -> Result<Result<Answer, std::io::Error>> {
++fn ask_tcp(host: &str, at: impl Into<SocketAddr>) -> Result<Result<Answer, std::io::Error>> {
++    let at = at.into();
+     let id = id();
+     let q = question(id, host)?;
+     let exchange = || -> std::io::Result<Vec<u8>> {
+-        let mut s = TcpStream::connect_timeout(&SocketAddr::V4(at), WAIT)?;
++        let mut s = TcpStream::connect_timeout(&at, WAIT)?;
+         s.set_read_timeout(Some(WAIT))?;
+         s.set_write_timeout(Some(WAIT))?;
+         let len = u16::try_from(q.len()).map_err(std::io::Error::other)?;
+@@ -175,6 +181,28 @@ fn ask_tcp(host: &str, at: SocketAddrV4) -> Result<Result<Answer, std::io::Error
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::net::SocketAddrV4;
++
++    #[test]
++    fn a_transport_failure_uses_the_secondary_dns_server() {
++        let (server, at) = serving(|q| served(q, &ADDRESSES, false));
++        let failed = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
++        assert_eq!(ask_in_turn("update.example.com", &[failed, at]).unwrap(), ADDRESSES);
++        server.join().unwrap();
++    }
++
++    #[test]
++    fn an_ipv6_dns_server_can_answer_ipv4_questions() {
++        let Ok(udp) = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) else { return };
++        let at = udp.local_addr().unwrap();
++        let server = std::thread::spawn(move || {
++            let mut packet = [0; 1500];
++            let (n, from) = udp.recv_from(&mut packet).unwrap();
++            udp.send_to(&served(&packet[..n], &ADDRESSES, false), from).unwrap();
++        });
++        assert_eq!(ask_server("update.example.com", at).unwrap().unwrap(), ADDRESSES);
++        server.join().unwrap();
++    }
+     use hickory_proto::rr::rdata::{A, CNAME};
+     use hickory_proto::rr::Record;
+ 
+diff --git a/crates/skyward-net/src/http.rs b/crates/skyward-net/src/http.rs
+index a5b8d6b..225c19b 100644
+--- a/crates/skyward-net/src/http.rs
++++ b/crates/skyward-net/src/http.rs
+@@ -2,7 +2,7 @@
+ //! gave.
+ 
+ use crate::dns;
+-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
++use std::net::{IpAddr, SocketAddr};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ use ureq::config::Config;
+@@ -11,7 +11,7 @@ use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+ use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+ 
+ /// The DNS servers to ask, as the network last gave them.
+-pub type Servers = Arc<Mutex<Vec<Ipv4Addr>>>;
++pub type Servers = Arc<Mutex<crate::network::State>>;
+ 
+ /// How long reaching a server may take.
+ const CONNECT: Duration = Duration::from_secs(15);
+@@ -27,12 +27,16 @@ impl Resolver for Lookup {
+     fn resolve(&self, uri: &Uri, _config: &Config, _timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+         let host = uri.host().ok_or_else(|| ureq::Error::BadUri(format!("{uri} names no host")))?;
+         let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("http") { 80 } else { 443 });
+-        let servers = self.0.lock().expect("the DNS servers are not held by a thread that panicked").clone();
+-        let found = dns::lookup(host, &servers).map_err(|e| ureq::Error::Io(std::io::Error::other(format!("{e:#}"))))?;
++        let servers = self.0.lock().expect("network settings lock").dns_servers();
++        let found = match host.trim_matches(['[', ']']).parse::<IpAddr>() {
++            Ok(ip) => vec![ip],
++            Err(_) => dns::lookup(host, &servers).map_err(|e| ureq::Error::Io(std::io::Error::other(format!("{e:#}"))))?
++                .into_iter().map(IpAddr::V4).collect(),
++        };
+         let mut out = self.empty();
+         // As many as it holds; the rest are not tried.
+         for address in found {
+-            if out.try_push(SocketAddr::new(IpAddr::V4(address), port)).is_err() {
++            if out.try_push(SocketAddr::new(address, port)).is_err() {
+                 break;
+             }
+         }
+@@ -43,8 +47,9 @@ impl Resolver for Lookup {
+ /// An agent that looks names up in `servers`, and gives a server's answer
+ /// whatever its status: the caller says what a status means.
+ pub fn agent(servers: Servers) -> ureq::Agent {
++    let proxy = servers.lock().expect("network settings lock").settings.proxy();
+     let config = ureq::Agent::config_builder()
+-        .proxy(None)
++        .proxy(proxy)
+         .timeout_connect(Some(CONNECT))
+         .timeout_per_read(Some(STALL))
+         .timeout_per_write(Some(STALL))
+@@ -52,3 +57,92 @@ pub fn agent(servers: Servers) -> ureq::Agent {
+         .build();
+     ureq::Agent::with_parts(config, DefaultConnector::new(), Lookup(servers))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::network::{Proxy, ProxyKind, Settings, State};
++    use std::io::{Read, Write};
++    use std::net::{TcpListener, TcpStream};
++
++    fn head(stream: &mut TcpStream) -> String {
++        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
++        let mut data = Vec::new();
++        while !data.ends_with(b"\r\n\r\n") {
++            let mut byte = [0];
++            stream.read_exact(&mut byte).unwrap();
++            data.push(byte[0]);
++            assert!(data.len() < 8192);
++        }
++        String::from_utf8(data).unwrap()
++    }
++
++    fn network(kind: ProxyKind, port: u16) -> Servers {
++        Arc::new(Mutex::new(State { settings: Settings {
++            proxy: Proxy { kind, server: "127.0.0.1".into(), port, username: "user".into(), password: "secret".into() },
++            ..Default::default()
++        }, ..Default::default() }))
++    }
++
++    #[test]
++    fn http_connect_and_authentication_work_without_local_target_dns() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let settings = network(ProxyKind::Http, listener.local_addr().unwrap().port());
++        let server = std::thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            let connect = head(&mut stream);
++            assert!(connect.starts_with("CONNECT download.invalid:80 HTTP/1.1\r\n"), "{connect}");
++            assert!(connect.to_ascii_lowercase().contains("proxy-authorization: basic dXNlcjpzZWNyZXQ=".to_ascii_lowercase().as_str()));
++            stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").unwrap();
++            assert!(head(&mut stream).starts_with("GET /image HTTP/1.1\r\n"));
++            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
++        });
++        let mut response = agent(settings).get("http://download.invalid/image").call().unwrap();
++        assert_eq!(response.body_mut().read_to_string().unwrap(), "ok");
++        server.join().unwrap();
++    }
++
++    #[test]
++    fn socks5_authentication_and_remote_dns_work() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let settings = network(ProxyKind::Socks5, listener.local_addr().unwrap().port());
++        let server = std::thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
++            let mut greeting = [0; 2];
++            stream.read_exact(&mut greeting).unwrap();
++            assert_eq!(greeting[0], 5);
++            let mut methods = vec![0; greeting[1] as usize];
++            stream.read_exact(&mut methods).unwrap();
++            assert!(methods.contains(&2));
++            stream.write_all(&[5, 2]).unwrap();
++            let mut auth = [0; 2];
++            stream.read_exact(&mut auth).unwrap();
++            assert_eq!(auth[0], 1);
++            let mut user = vec![0; auth[1] as usize];
++            stream.read_exact(&mut user).unwrap();
++            let mut len = [0];
++            stream.read_exact(&mut len).unwrap();
++            let mut password = vec![0; len[0] as usize];
++            stream.read_exact(&mut password).unwrap();
++            assert_eq!(user, b"user");
++            assert_eq!(password, b"secret");
++            stream.write_all(&[1, 0]).unwrap();
++            let mut connect = [0; 5];
++            stream.read_exact(&mut connect).unwrap();
++            assert_eq!(&connect[..4], &[5, 1, 0, 3]);
++            let mut domain = vec![0; connect[4] as usize];
++            stream.read_exact(&mut domain).unwrap();
++            assert_eq!(domain, b"download.invalid");
++            let mut port = [0; 2];
++            stream.read_exact(&mut port).unwrap();
++            assert_eq!(u16::from_be_bytes(port), 80);
++            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
++            assert!(head(&mut stream).starts_with("GET /image HTTP/1.1\r\n"));
++            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
++        });
++        let mut response = agent(settings).get("http://download.invalid/image").call().unwrap();
++        assert_eq!(response.body_mut().read_to_string().unwrap(), "ok");
++        server.join().unwrap();
++    }
++}
+diff --git a/crates/skyward-net/src/lib.rs b/crates/skyward-net/src/lib.rs
+index 1e33a39..9c44af4 100644
+--- a/crates/skyward-net/src/lib.rs
++++ b/crates/skyward-net/src/lib.rs
+@@ -3,6 +3,7 @@ pub mod dns;
+ pub mod download;
+ pub mod github;
+ pub mod http;
++pub mod network;
+ #[cfg(target_os = "android")]
+ pub mod iface;
+ pub mod reach;
+diff --git a/crates/skyward-net/src/network.rs b/crates/skyward-net/src/network.rs
+new file mode 100644
+index 0000000..be677be
+--- /dev/null
++++ b/crates/skyward-net/src/network.rs
+@@ -0,0 +1,190 @@
++//! Network preferences shared by the Wi-Fi pages and HTTP clients.
++
++use serde::{Deserialize, Serialize};
++use std::net::{IpAddr, Ipv4Addr};
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ProxyKind {
++    #[default]
++    None,
++    Http,
++    Socks5,
++}
++
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Proxy {
++    pub kind: ProxyKind,
++    pub server: String,
++    pub port: u16,
++    pub username: String,
++    pub password: String,
++}
++
++impl Default for Proxy {
++    fn default() -> Self {
++        Self { kind: ProxyKind::None, server: String::new(), port: 8080, username: String::new(), password: String::new() }
++    }
++}
++
++impl std::fmt::Debug for Proxy {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Proxy")
++            .field("kind", &self.kind)
++            .field("server", &self.server)
++            .field("port", &self.port)
++            .field("username", &self.username)
++            .field("password", &format_args!("{} characters", self.password.chars().count()))
++            .finish()
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Dns {
++    pub manual: bool,
++    pub primary: String,
++    pub secondary: String,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Settings {
++    pub proxy: Proxy,
++    pub dns: Dns,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Invalid {
++    ProxyServer,
++    ProxyPort,
++    ProxyUsername,
++    DnsPrimary,
++    DnsSecondary,
++}
++
++impl Settings {
++    pub fn validate(&self) -> Result<(), Invalid> {
++        if self.proxy.kind != ProxyKind::None {
++            let host = self.proxy.server.trim();
++            let ip = host.parse::<IpAddr>().is_ok();
++            let name = !host.is_empty()
++                && host.len() <= 253
++                && host.split('.').all(|part| !part.is_empty() && part.len() <= 63
++                    && !part.starts_with('-') && !part.ends_with('-')
++                    && part.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'));
++            if !ip && !name {
++                return Err(Invalid::ProxyServer);
++            }
++            if self.proxy.port == 0 {
++                return Err(Invalid::ProxyPort);
++            }
++            if !self.proxy.password.is_empty() && self.proxy.username.is_empty() {
++                return Err(Invalid::ProxyUsername);
++            }
++            if self.proxy.kind == ProxyKind::Socks5 && (self.proxy.username.len() > 255 || self.proxy.password.len() > 255) {
++                return Err(Invalid::ProxyUsername);
++            }
++        }
++        if self.dns.manual {
++            parse_dns(&self.dns.primary).map_err(|_| Invalid::DnsPrimary)?;
++            if !self.dns.secondary.trim().is_empty() {
++                parse_dns(&self.dns.secondary).map_err(|_| Invalid::DnsSecondary)?;
++            }
++        }
++        Ok(())
++    }
++
++    /// The manual servers, or the current DHCP lease's servers.
++    pub fn dns_servers(&self, dhcp: &[Ipv4Addr]) -> Vec<IpAddr> {
++        if !self.dns.manual {
++            return dhcp.iter().copied().map(IpAddr::V4).collect();
++        }
++        [&self.dns.primary, &self.dns.secondary].into_iter().filter_map(|s| parse_dns(s).ok()).collect()
++    }
++
++    pub fn proxy(&self) -> Option<ureq::Proxy> {
++        let protocol = match self.proxy.kind {
++            ProxyKind::None => return None,
++            ProxyKind::Http => ureq::ProxyProtocol::Http,
++            ProxyKind::Socks5 => ureq::ProxyProtocol::Socks5h,
++        };
++        let server = self.proxy.server.trim();
++        let host = if server.contains(':') { format!("[{server}]") } else { server.to_owned() };
++        let mut builder = ureq::Proxy::builder(protocol).host(&host).port(self.proxy.port).resolve_target(false);
++        if !self.proxy.username.is_empty() {
++            builder = builder.username(&self.proxy.username).password(&self.proxy.password);
++        }
++        Some(builder.build().expect("network settings validated before use"))
++    }
++}
++
++pub fn parse_dns(text: &str) -> Result<IpAddr, Invalid> {
++    let address: IpAddr = text.trim().parse().map_err(|_| Invalid::DnsPrimary)?;
++    if address.is_unspecified() || address.is_multicast() || address == IpAddr::V4(Ipv4Addr::BROADCAST) {
++        return Err(Invalid::DnsPrimary);
++    }
++    Ok(address)
++}
++
++/// DHCP updates its own values while manual preferences remain in place.
++#[derive(Clone, Debug, Default)]
++pub struct State {
++    pub dhcp: Vec<Ipv4Addr>,
++    pub settings: Settings,
++}
++
++impl State {
++    pub fn dns_servers(&self) -> Vec<IpAddr> {
++        self.settings.dns_servers(&self.dhcp)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn manual_dns_survives_a_new_lease_and_auto_uses_the_latest_lease() {
++        let mut state = State { dhcp: vec![Ipv4Addr::LOCALHOST], ..State::default() };
++        state.settings.dns = Dns { manual: true, primary: "1.1.1.1".into(), secondary: "2606:4700:4700::1111".into() };
++        assert!(state.settings.validate().is_ok());
++        state.dhcp = vec![Ipv4Addr::new(192, 168, 1, 1)];
++        assert_eq!(state.dns_servers(), ["1.1.1.1".parse::<IpAddr>().unwrap(), "2606:4700:4700::1111".parse().unwrap()]);
++        state.settings.dns.manual = false;
++        assert_eq!(state.dns_servers(), [IpAddr::V4(state.dhcp[0])]);
++    }
++
++    #[test]
++    fn proxy_dns_is_remote_and_credentials_are_encoded_and_redacted() {
++        let mut settings = Settings::default();
++        settings.proxy = Proxy { kind: ProxyKind::Socks5, server: "proxy.example".into(), port: 1080,
++            username: "a@b".into(), password: "p:a@ss".into() };
++        assert!(settings.validate().is_ok());
++        let proxy = settings.proxy().unwrap();
++        assert!(!proxy.resolve_target());
++        assert_eq!(proxy.username(), Some("a@b"));
++        assert_eq!(proxy.password(), Some("p:a@ss"));
++        assert!(!format!("{settings:?}").contains("p:a@ss"));
++        settings.proxy.server = "::1".into();
++        assert!(settings.validate().is_ok());
++        assert_eq!(settings.proxy().unwrap().port(), 1080);
++    }
++
++    #[test]
++    fn invalid_network_addresses_are_rejected() {
++        let mut settings = Settings::default();
++        settings.dns.manual = true;
++        for text in ["", "https://dns.example", "0.0.0.0", "255.255.255.255", "224.0.0.1", "::", "ff02::1"] {
++            settings.dns.primary = text.into();
++            assert_eq!(settings.validate(), Err(Invalid::DnsPrimary), "{text}");
++        }
++        settings.dns.manual = false;
++        settings.proxy.kind = ProxyKind::Http;
++        for text in ["", "http://proxy.example", "proxy.example:8080", "x/y", "bad host", "-bad.example"] {
++            settings.proxy.server = text.into();
++            assert_eq!(settings.validate(), Err(Invalid::ProxyServer), "{text}");
++        }
++    }
++}
+diff --git a/crates/skyward-net/src/reach.rs b/crates/skyward-net/src/reach.rs
+index c74b6a5..43ffd78 100644
+--- a/crates/skyward-net/src/reach.rs
++++ b/crates/skyward-net/src/reach.rs
+@@ -6,7 +6,7 @@
+ use crate::dns;
+ use anyhow::{anyhow, bail, ensure, Context, Result};
+ use std::io::{ErrorKind, Read, Write};
+-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
++use std::net::{IpAddr, SocketAddr, TcpStream};
+ use std::time::Duration;
+ use ureq::http::Uri;
+ 
+@@ -41,13 +41,28 @@ impl std::fmt::Display for Reach {
+ }
+ 
+ /// Ask `page`, a plain HTTP address, looking its host up in `servers`.
+-pub fn probe(page: &str, servers: &[Ipv4Addr]) -> Reach {
++pub fn probe(page: &str, servers: &[IpAddr]) -> Reach {
+     match answer(page, servers) {
+         Ok((code, location)) => judge(page, code, location),
+         Err(e) => Reach::Offline(format!("{e:#}")),
+     }
+ }
+ 
++/// Probe through the same proxy and DNS preferences as downloads.
++pub fn configured(page: &str, network: &crate::http::Servers) -> Reach {
++    let state = network.lock().expect("network settings lock").clone();
++    if state.settings.proxy.kind == crate::network::ProxyKind::None {
++        return probe(page, &state.dns_servers());
++    }
++    match crate::http::agent(network.clone()).get(page).config().max_redirects(0).build().call() {
++        Ok(response) => {
++            let location = response.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string);
++            judge(page, response.status().as_u16(), location)
++        }
++        Err(why) => Reach::Offline(why.to_string()),
++    }
++}
++
+ /// How far a network reaches, by what `page` answered: 204 is the page
+ /// itself, another answer a browser would show or follow is the network's
+ /// login, and any other is neither.
+@@ -60,7 +75,7 @@ fn judge(page: &str, code: u16, location: Option<String>) -> Reach {
+ }
+ 
+ /// What `page` answers: its status, and where it sends on to.
+-fn answer(page: &str, servers: &[Ipv4Addr]) -> Result<(u16, Option<String>)> {
++fn answer(page: &str, servers: &[IpAddr]) -> Result<(u16, Option<String>)> {
+     let uri: Uri = page.parse().with_context(|| format!("{page} is not an address"))?;
+     let (host, authority) = match (uri.host(), uri.authority()) {
+         (Some(host), Some(authority)) => (host, authority.as_str()),
+@@ -113,6 +128,7 @@ fn ask(mut stream: TcpStream, authority: &str, path: &str) -> Result<(u16, Optio
+ mod tests {
+     use super::*;
+     use std::net::TcpListener;
++    use std::net::Ipv4Addr;
+     use std::thread;
+ 
+     /// A server on the loopback answering one request with `answer`, and
 diff --git a/crates/skyward-pack/Cargo.toml b/crates/skyward-pack/Cargo.toml
 index cc4f55a..c0e1781 100644
 --- a/crates/skyward-pack/Cargo.toml
@@ -1767,13 +2326,24 @@ index 5bd3aee..82f77cd 100644
          cpu: Cpu { cores: 8, max_khz: Some(3_187_200) },
          ram_kib: 15_556_972,
 diff --git a/crates/skyward-ui/src/app/act.rs b/crates/skyward-ui/src/app/act.rs
-index 1033f0c..21db79d 100644
+index 1033f0c..754d0d5 100644
 --- a/crates/skyward-ui/src/app/act.rs
 +++ b/crates/skyward-ui/src/app/act.rs
-@@ -21,6 +21,16 @@ impl App {
+@@ -21,6 +21,27 @@ impl App {
                  }
                  return self.arrive_at(s);
              }
++            Action::BrowserAddress => self.edit_browser(BrowserEdit::Address, String::new()),
++            Action::BrowserClear => { self.state.browser.input.clear(); self.refresh(); }
++            Action::BrowserBack => return vec![Effect::Browser(BrowserCommand::Back)],
++            Action::BrowserForward => return vec![Effect::Browser(BrowserCommand::Forward)],
++            Action::BrowserReload => return vec![Effect::Browser(BrowserCommand::Reload)],
++            Action::BrowserKeyboard => return vec![Effect::Browser(BrowserCommand::Focus)],
++            Action::BrowserDownloads => {
++                self.state.files.path = "/sdcard/Download/Skyward".into();
++                self.open(Screen::Files);
++                return self.arrive_at(Screen::Files);
++            }
 +            Action::InstallBoot => {
 +                if !self.state.boot_install_available {
 +                    return Vec::new();
@@ -1787,6 +2357,168 @@ index 1033f0c..21db79d 100644
              Action::OpenData => return self.open_data(),
              Action::Skip => {
                  self.leave(true);
+@@ -478,6 +499,13 @@ impl App {
+                 self.state.adding.as_mut().expect("the protections open on the page that adds a network").choosing = false;
+                 self.refresh();
+             }
++            Action::EditNetwork(field) => self.edit_network(field),
++            Action::ChooseProxy(kind) => self.choose_proxy(kind),
++            Action::ManualDns(manual) => {
++                self.state.network_draft.as_mut().expect("DNS page").settings.dns.manual = manual;
++                self.refresh();
++            }
++            Action::SaveNetwork => return self.save_network(now),
+             // Asking takes a network, which the WLAN page joins.
+             Action::CheckUpdate => {
+                 if !self.state.online() {
+@@ -573,6 +601,8 @@ impl App {
+             Screen::Decrypt => &mut self.state.code,
+             Screen::Rename => &mut self.state.new_name,
+             Screen::WlanPassword => &mut self.state.password,
++            Screen::BrowserInput => &mut self.state.browser.input,
++            Screen::NetworkInput => &mut self.state.network_draft.as_mut().expect("network input").text,
+             Screen::WlanAdd => {
+                 let a = self.state.adding.as_mut().expect("the page adds a network");
+                 match a.field {
+@@ -610,6 +640,8 @@ impl App {
+             }
+             Cap::Show(layer) => self.state.layer = layer,
+             Cap::Enter => match self.screen() {
++                Screen::BrowserInput => return self.submit_browser(now),
++                Screen::NetworkInput => return self.finish_network_input(now),
+                 Screen::Search => {
+                     if let Some(first) = search::find_on(&self.state.search, l, |screen| self.state.offers(screen)).first() {
+                         return self.act(Action::Open(first.screen), now);
+diff --git a/crates/skyward-ui/src/app/browser.rs b/crates/skyward-ui/src/app/browser.rs
+new file mode 100644
+index 0000000..c774103
+--- /dev/null
++++ b/crates/skyward-ui/src/app/browser.rs
+@@ -0,0 +1,112 @@
++//! Browser navigation, text entry and the webpage's native input bridge.
++use super::*;
++use serde::Serialize;
++use std::sync::Arc;
++
++#[derive(Clone, Debug, PartialEq, Serialize)]
++#[serde(tag = "cmd", rename_all = "snake_case")]
++pub enum BrowserCommand {
++    Open, Close, Back, Forward, Reload, Focus,
++    Navigate { url: String },
++    Text { text: String },
++    Touch { phase: u8, x: f32, y: f32 },
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub enum BrowserEdit { #[default] Address, Field { secret: bool } }
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct BrowserPixels { pub w: u32, pub h: u32, pub rgba: Vec<u8> }
++impl std::fmt::Debug for BrowserPixels {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_tuple("BrowserPixels").field(&self.w).field(&self.h).finish() }
++}
++
++#[derive(Clone, Default, PartialEq)]
++pub struct BrowserState {
++    pub enabled: bool, pub running: bool, pub loading: bool,
++    pub url: String, pub title: String, pub error: Option<String>,
++    pub back: bool, pub forward: bool, pub download: String,
++    pub frame: Option<Arc<BrowserPixels>>,
++    pub edit: BrowserEdit, pub input: String,
++    finger: Option<(f32, f32)>,
++}
++impl std::fmt::Debug for BrowserState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("BrowserState").field("running", &self.running).field("loading", &self.loading).field("error", &self.error).finish()
++    }
++}
++
++/// WebKit receives CSS pixels; the native page reserves its bars in panel pixels.
++pub fn browser_viewport(t: &Theme) -> Rect {
++    let y = t.m.content_top + t.m.row_h + t.m.dp(10.0);
++    Rect::new(0.0, y, t.m.w as f32, (t.m.h as f32 - y - t.m.dp(118.0)).max(1.0))
++}
++
++pub fn browser_url(text: &str) -> Option<String> {
++    let text = text.trim();
++    if text.is_empty() || text.len() > 8192 || text.chars().any(|c| c.is_control() || c.is_whitespace()) { return None; }
++    let url = if text.starts_with("https://") || text.starts_with("http://") { text.to_owned() }
++        else if text.contains("://") || text.starts_with("javascript:") || text.starts_with("data:") || text.starts_with("file:") { return None; }
++        else { format!("https://{text}") };
++    let host = url.split_once("://")?.1.split('/').next()?;
++    if host.is_empty() { None } else { Some(url) }
++}
++
++impl App {
++    pub fn browser_changed(&mut self) { self.refresh(); }
++    pub fn browser_field(&mut self, text: String, secret: bool) {
++        if self.screen() == Screen::Browser { self.edit_browser(BrowserEdit::Field { secret }, text); }
++    }
++    pub(super) fn edit_browser(&mut self, edit: BrowserEdit, text: String) {
++        self.state.browser.input = if edit == BrowserEdit::Address { self.state.browser.url.clone().strip_prefix("file:").map_or_else(|| self.state.browser.url.clone(), |_| String::new()) } else { text };
++        self.state.browser.edit = edit;
++        self.state.layer = Layer::Letters;
++        self.open(Screen::BrowserInput);
++    }
++    pub(super) fn submit_browser(&mut self, now: u64) -> Vec<Effect> {
++        let command = match self.state.browser.edit {
++            BrowserEdit::Address => match browser_url(&self.state.browser.input) {
++                Some(url) => BrowserCommand::Navigate { url },
++                None => { self.say(self.state.lang.pick(["请输入 HTTP 或 HTTPS 网址", "請輸入 HTTP 或 HTTPS 網址", "Enter an HTTP or HTTPS address"]), now); return Vec::new(); }
++            },
++            BrowserEdit::Field { .. } => BrowserCommand::Text { text: std::mem::take(&mut self.state.browser.input) },
++        };
++        let mut effects = self.back(now);
++        effects.push(Effect::Browser(command));
++        effects
++    }
++    pub(super) fn browser_touch(&mut self, ev: Touch) -> Option<Vec<Effect>> {
++        if self.screen() != Screen::Browser { return None; }
++        if self.state.browser.error.is_some() { return None; }
++        let rect = browser_viewport(&self.theme());
++        let size = self.state.browser.frame.as_ref().map(|p| (p.w as f32, p.h as f32));
++        let size = size?;
++        let (phase, x, y) = match ev {
++            Touch::Down(x,y) if rect.contains(x,y) => { self.state.browser.finger = Some((x,y)); (0,x,y) },
++            Touch::Move(x,y) if self.state.browser.finger.is_some() => { self.state.browser.finger = Some((x,y)); (1,x,y) },
++            Touch::Up => { let (x,y) = self.state.browser.finger.take()?; (2,x,y) },
++            _ => return None,
++        };
++        Some(vec![Effect::Browser(BrowserCommand::Touch { phase, x: (x-rect.x)*size.0/rect.w, y: (y-rect.y)*size.1/rect.h })])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn addresses_allow_web_navigation() {
++        assert_eq!(browser_url(" example.com/a?b=1 ").as_deref(), Some("https://example.com/a?b=1"));
++        assert_eq!(browser_url("http://192.0.2.1/").as_deref(), Some("http://192.0.2.1/"));
++        for url in ["", "file:///etc/passwd", "javascript:alert(1)", "data:text/html,hi", "https://", "two words"] { assert_eq!(browser_url(url), None); }
++    }
++    #[test] fn webpage_drag_keeps_its_coordinates_through_release() {
++        let mut app=App::new(Screen::Browser,1600,2560,2.25);
++        app.state.browser.frame=Some(Arc::new(BrowserPixels{w:800,h:1000,rgba:vec![]}));
++        let r=browser_viewport(&app.theme());
++        assert!(app.browser_touch(Touch::Down(800.0,r.y+100.0)).is_some());
++        app.browser_touch(Touch::Move(900.0,r.y+200.0));
++        let fx=app.browser_touch(Touch::Up).unwrap();
++        assert!(matches!(fx[0], Effect::Browser(BrowserCommand::Touch{phase:2,x,..}) if x==450.0));
++        assert!(app.browser_touch(Touch::Up).is_none());
++    }
++}
+diff --git a/crates/skyward-ui/src/app/input.rs b/crates/skyward-ui/src/app/input.rs
+index 9fe100d..eb79f5b 100644
+--- a/crates/skyward-ui/src/app/input.rs
++++ b/crates/skyward-ui/src/app/input.rs
+@@ -38,6 +38,7 @@ impl App {
+             self.end_turn();
+         }
+         self.stir(now);
++        if let Some(effects) = self.browser_touch(ev) { return effects; }
+         let t = self.theme();
+         let m = t.m;
+         let (slop, edge) = (m.dp(8.0), m.dp(20.0));
 diff --git a/crates/skyward-ui/src/app/install.rs b/crates/skyward-ui/src/app/install.rs
 index ffb4f84..554c512 100644
 --- a/crates/skyward-ui/src/app/install.rs
@@ -1813,10 +2545,69 @@ index ffb4f84..554c512 100644
      fn leaving_while_waiting_cancels_and_the_end_clears_it() {
          let (f, i) = (fonts(), info());
 diff --git a/crates/skyward-ui/src/app/mod.rs b/crates/skyward-ui/src/app/mod.rs
-index c05e99f..c703bd3 100644
+index c05e99f..a212de6 100644
 --- a/crates/skyward-ui/src/app/mod.rs
 +++ b/crates/skyward-ui/src/app/mod.rs
-@@ -325,6 +325,8 @@ pub enum Action {
+@@ -35,6 +35,7 @@ use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
+ 
+ mod act;
+ mod backup;
++mod browser;
+ mod decrypt;
+ mod draw;
+ mod entry;
+@@ -45,6 +46,7 @@ mod install;
+ mod keys;
+ mod manager;
+ mod mount;
++mod network;
+ mod nav;
+ mod power;
+ mod prefs;
+@@ -62,6 +64,7 @@ mod wipe;
+ mod wlan;
+ 
+ pub use backup::*;
++pub use browser::*;
+ pub use decrypt::*;
+ pub use entry::*;
+ pub use filesystem::*;
+@@ -69,6 +72,7 @@ pub use frame::*;
+ pub use install::*;
+ pub use manager::*;
+ pub use mount::*;
++pub use network::*;
+ pub use prefs::*;
+ pub use reboot::*;
+ pub use relabel::*;
+@@ -186,6 +190,12 @@ pub enum Screen {
+     /// A network added by hand: its name, how it is protected and its
+     /// password, typed on the screen's keyboard.
+     WlanAdd,
++    WlanAdvanced,
++    WlanProxy,
++    WlanDns,
++    NetworkInput,
++    Browser,
++    BrowserInput,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -229,6 +239,13 @@ pub enum Confirm {
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum Action {
+     Open(Screen),
++    BrowserAddress,
++    BrowserClear,
++    BrowserBack,
++    BrowserForward,
++    BrowserReload,
++    BrowserKeyboard,
++    BrowserDownloads,
+     /// Leave the decrypt page for the page it was opened from; the page
+     /// the recovery started on, for the home page without keeping it
+     /// behind.
+@@ -325,6 +342,8 @@ pub enum Action {
      EditEntry,
      /// Install the file the file page shows.
      InstallEntry,
@@ -1825,8 +2616,372 @@ index c05e99f..c703bd3 100644
      /// Write the file the editor page shows as it now stands.
      SaveText,
      /// Open the page of the permissions of the entry the file page shows.
+@@ -367,6 +386,10 @@ pub enum Action {
+     PickSecurity(Security),
+     /// Close the list open over the page, choosing nothing.
+     CloseChoices,
++    EditNetwork(NetworkField),
++    ChooseProxy(skyward_net::network::ProxyKind),
++    ManualDns(bool),
++    SaveNetwork,
+     /// Ask the update server for the newest system.
+     CheckUpdate,
+     /// Download the newest system's full package, or carry on downloading
+@@ -415,6 +438,7 @@ pub enum Shot {
+ /// Work the runtime carries out on the UI's behalf.
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Effect {
++    Browser(BrowserCommand),
+     Reboot(Target),
+     /// A short tap of the vibration motor.
+     Haptic,
+@@ -571,6 +595,7 @@ pub enum Effect {
+     ScanWlan,
+     JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
+     LeaveWlan,
++    NetworkSettings(skyward_net::network::Settings),
+     /// Ask the update server for the newest system, telling what it
+     /// answered with [`App::update_checked`].
+     CheckUpdate,
+diff --git a/crates/skyward-ui/src/app/nav.rs b/crates/skyward-ui/src/app/nav.rs
+index 94a7f80..7720831 100644
+--- a/crates/skyward-ui/src/app/nav.rs
++++ b/crates/skyward-ui/src/app/nav.rs
+@@ -89,6 +89,13 @@ impl App {
+         }
+         let left = self.screen();
+         match left {
++            Screen::Browser => {
++                self.state.browser.running = false;
++                self.state.browser.frame = None;
++                self.state.browser.input.clear();
++                fx.push(Effect::Browser(BrowserCommand::Close));
++            }
++            Screen::BrowserInput => self.state.browser.input.clear(),
+             Screen::Mount => self.state.mount_failure = None,
+             // A slot picked and not switched to is put down.
+             Screen::Slot => self.state.next_slot = None,
+@@ -138,6 +145,13 @@ impl App {
+                 self.state.password.clear();
+             }
+             Screen::WlanNetwork => self.state.details = None,
++            Screen::WlanProxy | Screen::WlanDns => self.state.network_draft = None,
++            Screen::NetworkInput => {
++                if let Some(draft) = self.state.network_draft.as_mut() {
++                    draft.field = None;
++                    draft.text.clear();
++                }
++            }
+             // A list open over the page closes first.
+             Screen::WlanAdd => {
+                 if let Some(a) = self.state.adding.as_mut().filter(|a| a.choosing) {
+@@ -284,6 +298,15 @@ impl App {
+     /// how it learns which control a user's screen lock is answered with.
+     pub(super) fn arrive_at(&mut self, s: Screen) -> Vec<Effect> {
+         match s {
++            Screen::Browser => {
++                self.state.browser.loading = true;
++                self.state.browser.error = None;
++                vec![Effect::Browser(BrowserCommand::Open)]
++            }
++            Screen::WlanProxy | Screen::WlanDns => {
++                self.network_draft();
++                Vec::new()
++            }
+             Screen::Mount => vec![Effect::ReadMounts],
+             Screen::Filesystems => vec![Effect::ReadFilesystems],
+             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
+diff --git a/crates/skyward-ui/src/app/network.rs b/crates/skyward-ui/src/app/network.rs
+new file mode 100644
+index 0000000..1a7302a
+--- /dev/null
++++ b/crates/skyward-ui/src/app/network.rs
+@@ -0,0 +1,283 @@
++//! Editing proxy and DNS preferences before applying them together.
++
++use super::*;
++use skyward_net::network::{self, Invalid, ProxyKind, Settings as NetworkSettings};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NetworkField {
++    ProxyServer,
++    ProxyPort,
++    ProxyUsername,
++    ProxyPassword,
++    DnsPrimary,
++    DnsSecondary,
++}
++
++impl NetworkField {
++    pub fn title(self, l: Lang) -> &'static str {
++        l.pick(match self {
++            Self::ProxyServer => ["代理服务器", "代理伺服器", "Proxy server"],
++            Self::ProxyPort => ["端口", "連接埠", "Port"],
++            Self::ProxyUsername => ["用户名", "使用者名稱", "Username"],
++            Self::ProxyPassword => ["代理密码", "代理密碼", "Proxy password"],
++            Self::DnsPrimary => ["首选 DNS", "慣用 DNS", "Primary DNS"],
++            Self::DnsSecondary => ["备用 DNS", "其他 DNS", "Secondary DNS"],
++        })
++    }
++}
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct NetworkDraft {
++    pub settings: NetworkSettings,
++    pub field: Option<NetworkField>,
++    pub text: String,
++}
++
++impl std::fmt::Debug for NetworkDraft {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NetworkDraft").field("settings", &self.settings)
++            .field("field", &self.field).field("text_characters", &self.text.chars().count()).finish()
++    }
++}
++
++pub fn network_error(l: Lang, error: Invalid) -> &'static str {
++    l.pick(match error {
++        Invalid::ProxyServer => ["请输入代理服务器的 IP 地址或域名", "請輸入代理伺服器的 IP 位址或網域名稱", "Enter a proxy server IP address or hostname"],
++        Invalid::ProxyPort => ["端口必须为 1 到 65535", "連接埠必須為 1 到 65535", "Enter a port from 1 to 65535"],
++        Invalid::ProxyUsername => ["请检查代理用户名和密码", "請檢查代理使用者名稱和密碼", "Check the proxy username and password"],
++        Invalid::DnsPrimary => ["请输入有效的首选 DNS IP 地址", "請輸入有效的慣用 DNS IP 位址", "Enter a valid primary DNS IP address"],
++        Invalid::DnsSecondary => ["请输入有效的备用 DNS IP 地址，或留空", "請輸入有效的其他 DNS IP 位址，或留白", "Enter a valid secondary DNS IP address, or leave it empty"],
++    })
++}
++
++impl App {
++    pub(super) fn network_draft(&mut self) {
++        self.state.network_draft = Some(NetworkDraft { settings: self.state.network.clone(), field: None, text: String::new() });
++    }
++
++    pub(super) fn edit_network(&mut self, field: NetworkField) {
++        let draft = self.state.network_draft.as_mut().expect("network preferences page");
++        draft.field = Some(field);
++        draft.text = match field {
++            NetworkField::ProxyServer => draft.settings.proxy.server.clone(),
++            NetworkField::ProxyPort => draft.settings.proxy.port.to_string(),
++            NetworkField::ProxyUsername => draft.settings.proxy.username.clone(),
++            NetworkField::ProxyPassword => draft.settings.proxy.password.clone(),
++            NetworkField::DnsPrimary => draft.settings.dns.primary.clone(),
++            NetworkField::DnsSecondary => draft.settings.dns.secondary.clone(),
++        };
++        self.state.show_password = false;
++        self.state.layer = match field {
++            NetworkField::ProxyPort | NetworkField::DnsPrimary | NetworkField::DnsSecondary => Layer::Digits,
++            _ => Layer::Letters,
++        };
++        self.open(Screen::NetworkInput);
++    }
++
++    pub(super) fn finish_network_input(&mut self, now: u64) -> Vec<Effect> {
++        let draft = self.state.network_draft.as_mut().expect("network preferences page");
++        let field = draft.field.expect("network input field");
++        let text = draft.text.trim().to_string();
++        let invalid = match field {
++            NetworkField::ProxyServer => {
++                let mut check = draft.settings.clone();
++                check.proxy.server = text.clone();
++                match check.validate() {
++                    Err(Invalid::ProxyServer) => Some(Invalid::ProxyServer),
++                    _ => { draft.settings.proxy.server = text; None }
++                }
++            }
++            NetworkField::ProxyPort => match text.parse::<u16>().ok().filter(|&port| port > 0) {
++                Some(port) => { draft.settings.proxy.port = port; None }
++                None => Some(Invalid::ProxyPort),
++            },
++            NetworkField::ProxyUsername => { draft.settings.proxy.username = draft.text.clone(); None }
++            NetworkField::ProxyPassword => { draft.settings.proxy.password = draft.text.clone(); None }
++            NetworkField::DnsPrimary | NetworkField::DnsSecondary => {
++                if field == NetworkField::DnsSecondary && text.is_empty() {
++                    draft.settings.dns.secondary.clear();
++                    None
++                } else {
++                    match network::parse_dns(&text) {
++                        Ok(ip) => {
++                            if field == NetworkField::DnsPrimary { draft.settings.dns.primary = ip.to_string(); }
++                            else { draft.settings.dns.secondary = ip.to_string(); }
++                            None
++                        }
++                        Err(_) => Some(if field == NetworkField::DnsPrimary { Invalid::DnsPrimary } else { Invalid::DnsSecondary }),
++                    }
++                }
++            }
++        };
++        if let Some(error) = invalid {
++            self.say(network_error(self.state.lang, error), now);
++            return Vec::new();
++        }
++        self.back(now)
++    }
++
++    pub(super) fn save_network(&mut self, now: u64) -> Vec<Effect> {
++        let settings = self.state.network_draft.as_ref().expect("network preferences page").settings.clone();
++        if let Err(error) = settings.validate() {
++            self.say(network_error(self.state.lang, error), now);
++            return Vec::new();
++        }
++        let changed = self.state.network != settings;
++        self.state.network = settings.clone();
++        let mut effects = self.back(now);
++        if changed { effects.push(Effect::NetworkSettings(settings)); }
++        effects
++    }
++
++    pub(super) fn choose_proxy(&mut self, kind: ProxyKind) {
++        let proxy = &mut self.state.network_draft.as_mut().expect("proxy page").settings.proxy;
++        if proxy.kind != kind {
++            if matches!(proxy.port, 8080 | 1080) {
++                proxy.port = if kind == ProxyKind::Socks5 { 1080 } else { 8080 };
++            }
++            proxy.kind = kind;
++            self.refresh();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::app::testing::*;
++
++    fn open() -> App {
++        let mut app = App::new(Screen::Wlan, W, H, PPD);
++        app.state.wlan = Some(Wlan::default());
++        app.act(Action::Open(Screen::WlanAdvanced), 0);
++        app
++    }
++
++    fn replace(app: &mut App, text: &str) {
++        while !app.state.network_draft.as_ref().unwrap().text.is_empty() {
++            app.act(Action::Type(Cap::Backspace), 0);
++        }
++        for ch in text.chars() {
++            app.act(Action::Type(Cap::Char(ch)), 0);
++        }
++    }
++
++    #[test]
++    fn manual_dns_is_validated_saved_and_restored_and_back_discards_edits() {
++        let (f, i) = (fonts(), info());
++        let mut app = open();
++        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::WlanDns)));
++        app.act(Action::Open(Screen::WlanDns), 0);
++        app.act(Action::ManualDns(true), 0);
++        assert!(app.act(Action::SaveNetwork, 0).is_empty());
++        assert_eq!(app.screen(), Screen::WlanDns);
++        assert!(!app.state.network.dns.manual);
++        app.act(Action::EditNetwork(NetworkField::DnsPrimary), 0);
++        replace(&mut app, "not-an-ip");
++        app.act(Action::Type(Cap::Enter), 0);
++        assert_eq!(app.screen(), Screen::NetworkInput);
++        replace(&mut app, "1.1.1.1");
++        app.act(Action::Type(Cap::Enter), 0);
++        assert_eq!(app.screen(), Screen::WlanDns);
++        assert_eq!(app.state.network_draft.as_ref().unwrap().settings.dns.primary, "1.1.1.1");
++        app.act(Action::EditNetwork(NetworkField::DnsSecondary), 0);
++        replace(&mut app, "2606:4700:4700::1111");
++        app.act(Action::Type(Cap::Enter), 0);
++        let effects = app.act(Action::SaveNetwork, 0);
++        assert_eq!(effects, vec![Effect::NetworkSettings(app.state.network.clone())]);
++        let saved = Settings::read(&app.settings().text()).unwrap();
++        let mut restored = State::default();
++        saved.apply(&mut restored);
++        assert_eq!(restored.network, app.state.network);
++        app.act(Action::Open(Screen::WlanDns), 0);
++        app.act(Action::ManualDns(false), 0);
++        app.act(Action::Back, 0);
++        assert!(app.state.network.dns.manual, "back leaves the saved choice in place");
++        app.act(Action::Open(Screen::WlanDns), 0);
++        app.act(Action::ManualDns(false), 0);
++        app.act(Action::SaveNetwork, 0);
++        assert!(!app.state.network.dns.manual);
++        assert_eq!(app.state.network.dns.primary, "1.1.1.1", "manual addresses remain available when toggled back");
++    }
++
++    #[test]
++    fn proxy_port_and_credentials_are_edited_before_applying() {
++        let mut app = open();
++        app.act(Action::Open(Screen::WlanProxy), 0);
++        app.act(Action::ChooseProxy(ProxyKind::Socks5), 0);
++        assert_eq!(app.state.network_draft.as_ref().unwrap().settings.proxy.port, 1080);
++        app.act(Action::EditNetwork(NetworkField::ProxyServer), 0);
++        replace(&mut app, "http://proxy.example");
++        app.act(Action::Type(Cap::Enter), 0);
++        assert_eq!(app.screen(), Screen::NetworkInput);
++        replace(&mut app, "proxy.example");
++        app.act(Action::Type(Cap::Enter), 0);
++        app.act(Action::EditNetwork(NetworkField::ProxyPort), 0);
++        replace(&mut app, "65536");
++        app.act(Action::Type(Cap::Enter), 0);
++        assert_eq!(app.screen(), Screen::NetworkInput);
++        replace(&mut app, "1080");
++        app.act(Action::Type(Cap::Enter), 0);
++        app.act(Action::EditNetwork(NetworkField::ProxyUsername), 0);
++        replace(&mut app, "user");
++        app.act(Action::Type(Cap::Enter), 0);
++        app.act(Action::EditNetwork(NetworkField::ProxyPassword), 0);
++        replace(&mut app, "private-password");
++        assert!(!format!("{:?}", app.state.network_draft).contains("private-password"));
++        assert!(!app.state.show_password);
++        app.act(Action::Type(Cap::Enter), 0);
++        let effects = app.act(Action::SaveNetwork, 0);
++        assert_eq!(effects, vec![Effect::NetworkSettings(app.state.network.clone())]);
++        assert!(!format!("{effects:?}").contains("private-password"));
++        assert_eq!(app.state.network.proxy.kind, ProxyKind::Socks5);
++        app.act(Action::Open(Screen::WlanProxy), 0);
++        app.act(Action::ChooseProxy(ProxyKind::None), 0);
++        app.act(Action::SaveNetwork, 0);
++        assert_eq!(app.state.network.proxy.kind, ProxyKind::None);
++        assert_eq!(app.state.network.proxy.server, "proxy.example");
++    }
++
++    #[test]
++    fn network_pages_fit_nabu_and_render_in_both_themes() {
++        let (f, mut i) = (fonts(), info());
++        i.model = "Xiaomi Pad 5".into();
++        i.codename = "nabu".into();
++        i.panel = Some((1600, 2560));
++        let output = std::env::var_os("SKYWARD_NETWORK_PREVIEWS").map(std::path::PathBuf::from);
++        if let Some(path) = &output { std::fs::create_dir_all(path).unwrap(); }
++        for dark in [true, false] {
++            for (name, screen, field) in [
++                ("wifi", Screen::Wlan, None),
++                ("advanced", Screen::WlanAdvanced, None),
++                ("proxy", Screen::WlanProxy, None),
++                ("proxy-long", Screen::WlanProxy, None),
++                ("dns", Screen::WlanDns, None),
++                ("server", Screen::NetworkInput, Some(NetworkField::ProxyServer)),
++                ("dns-input", Screen::NetworkInput, Some(NetworkField::DnsPrimary)),
++                ("password", Screen::NetworkInput, Some(NetworkField::ProxyPassword)),
++            ] {
++                let mut app = App::new(screen, 1600, 2560, 2.25);
++                app.state.dark = dark;
++                app.state.wlan = Some(Wlan::default());
++                app.state.network.proxy = network::Proxy { kind: ProxyKind::Socks5, server: "proxy.example.com".into(), port: 1080,
++                    username: "user".into(), password: "private-password".into() };
++                app.state.network.dns = network::Dns { manual: true, primary: "1.1.1.1".into(), secondary: "2606:4700:4700::1111".into() };
++                if name == "proxy-long" {
++                    app.state.network.proxy.server = format!("{}.{}.{}.example.com", "a".repeat(63), "b".repeat(63), "c".repeat(63));
++                    app.state.network.proxy.username = "u".repeat(255);
++                }
++                app.network_draft();
++                if let Some(field) = field {
++                    app.edit_network(field);
++                }
++                let frame = app.whole_frame(&f, &i);
++                assert!(frame.hits.iter().all(|hit| hit.rect.x >= 0.0 && hit.rect.x + hit.rect.w <= 1601.0));
++                let mut image = Canvas::new(1600, 2560);
++                app.compose(&mut image, &f, &i, "12:00", 1000);
++                if let Some(path) = &output {
++                    image.write_png(std::fs::File::create(path.join(format!("{name}-{}.png", if dark { "dark" } else { "light" }))).unwrap()).unwrap();
++                }
++            }
++        }
++    }
++}
 diff --git a/crates/skyward-ui/src/app/state.rs b/crates/skyward-ui/src/app/state.rs
-index 24de4cc..cb08794 100644
+index 24de4cc..3b3dd81 100644
 --- a/crates/skyward-ui/src/app/state.rs
 +++ b/crates/skyward-ui/src/app/state.rs
 @@ -49,6 +49,7 @@ pub struct State {
@@ -1837,7 +2992,17 @@ index 24de4cc..cb08794 100644
      /// Skyward goes back into the recovery partitions an install writes
      /// over.
      pub keep_recovery: bool,
-@@ -208,6 +209,7 @@ impl Default for State {
+@@ -158,6 +159,9 @@ pub struct State {
+     /// The WLAN, as the runtime last told it; none on a phone whose WLAN the
+     /// recovery does not bring up.
+     pub wlan: Option<Wlan>,
++    pub network: skyward_net::network::Settings,
++    pub network_draft: Option<NetworkDraft>,
++    pub browser: BrowserState,
+     /// The network the password page is for, and what is typed there.
+     pub joining: Option<Network>,
+     /// The network the details page is of, as it was found.
+@@ -208,6 +212,7 @@ impl Default for State {
              script_output: Vec::new(),
              check_signature: false,
              recovery_partitions: false,
@@ -1845,6 +3010,25 @@ index 24de4cc..cb08794 100644
              keep_recovery: true,
              reflash: None,
              mounts: Ok(Vec::new()),
+@@ -254,6 +259,9 @@ impl Default for State {
+             part_work: None,
+             update: Standing::None,
+             wlan: None,
++            network: Default::default(),
++            network_draft: None,
++            browser: BrowserState::default(),
+             joining: None,
+             details: None,
+             adding: None,
+@@ -344,7 +352,7 @@ impl State {
+     /// phone also keeps its recovery in a partition of each slot.
+     pub fn offers(&self, screen: Screen) -> bool {
+         match screen {
+-            Screen::Wlan => self.wlan.is_some(),
++            Screen::Wlan | Screen::WlanAdvanced | Screen::WlanProxy | Screen::WlanDns => self.wlan.is_some(),
+             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
+             Screen::Systems => self.dual_boot,
+             _ => true,
 diff --git a/crates/skyward-ui/src/app/testing.rs b/crates/skyward-ui/src/app/testing.rs
 index 04d86fa..257e904 100644
 --- a/crates/skyward-ui/src/app/testing.rs
@@ -1857,11 +3041,70 @@ index 04d86fa..257e904 100644
          soc: None,
          cpu: Cpu { cores: 8, max_khz: Some(3_187_200) },
          ram_kib: 15_556_972,
+diff --git a/crates/skyward-ui/src/canvas.rs b/crates/skyward-ui/src/canvas.rs
+index 0ac0a6c..f75b77a 100644
+--- a/crates/skyward-ui/src/canvas.rs
++++ b/crates/skyward-ui/src/canvas.rs
+@@ -148,6 +148,22 @@ impl Canvas {
+         Ok(())
+     }
+ 
++    /// Scale an RGBA webpage into the panel rectangle, respecting a partial canvas.
++    pub fn image_rgba(&mut self, r: crate::geom::Rect, w: u32, h: u32, pixels: &[u8]) {
++        if w == 0 || h == 0 || pixels.len() != w as usize * h as usize * 4 || r.w <= 0.0 || r.h <= 0.0 { return; }
++        let (y0,y1)=self.rows(r.y.ceil() as i32,(r.y+r.h).ceil() as i32);
++        let (x0,x1)=self.columns(r.x.ceil() as i32,(r.x+r.w).ceil() as i32);
++        for y in y0..y1 {
++            let sy=(((y as f32-r.y)*h as f32/r.h) as u32).min(h-1);
++            for x in x0..x1 {
++                let sx=(((x as f32-r.x)*w as f32/r.w) as u32).min(w-1);
++                let src=((sy*w+sx)*4) as usize;
++                let dst=(((y as u32-self.top)*self.span+x as u32-self.left)*4) as usize;
++                self.data[dst..dst+4].copy_from_slice(&pixels[src..src+4]);
++            }
++        }
++    }
++
+     /// Take on the rows `band` holds, the same columns of them as this
+     /// canvas holds, which run on from this canvas's last row or up to its
+     /// first.
 diff --git a/crates/skyward-ui/src/pages.rs b/crates/skyward-ui/src/pages.rs
-index 1951193..9eb5ecb 100644
+index 1951193..c5bc311 100644
 --- a/crates/skyward-ui/src/pages.rs
 +++ b/crates/skyward-ui/src/pages.rs
-@@ -576,6 +576,16 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
+@@ -1,6 +1,6 @@
+ use crate::app::{
+     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
+-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
++    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, NetworkField, Pick, Place, Rows, Screen,
+     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
+     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
+     USB_DRIVE_WANTED, WIPES, installs, starting,
+@@ -109,6 +109,12 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
+         Screen::WlanPassword => wlan_password(cx),
+         Screen::WlanNetwork => wlan_network(cx),
+         Screen::WlanAdd => wlan_add(cx),
++        Screen::WlanAdvanced => network::advanced(cx),
++        Screen::WlanProxy => network::proxy(cx),
++        Screen::WlanDns => network::dns(cx),
++        Screen::NetworkInput => network::input(cx),
++        Screen::Browser => browser::page(cx),
++        Screen::BrowserInput => browser::input(cx),
+     }
+ }
+ 
+@@ -271,6 +277,10 @@ pub fn home(cx: &Ctx) -> Frame {
+         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
+         opens.push(Action::Open(Screen::Wlan));
+     }
++    if cx.state.browser.enabled {
++        rows.push(Row::new(l.pick(browser::TITLE)).icon(BLUE, Icon::Globe));
++        opens.push(Action::Open(Screen::Browser));
++    }
+     let starts = systems_value(cx);
+     if cx.state.offers(Screen::Systems) {
+         let row = Row::new(l.pick(DUAL_BOOT)).icon(PURPLE, Icon::Systems);
+@@ -576,6 +586,16 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
      let summary = widgets::facts(c, t, f, m.dp(490.7), &facts, &tone);
      out.push(Hit { rect: summary.rows[1], action: Action::Open(Screen::Specs) });
  
@@ -1878,7 +3121,7 @@ index 1951193..9eb5ecb 100644
      let processor = soc(l, i).map_or_else(|| fmt::cpu(l, &i.cpu), str::to_string);
      let mut specs = vec![(l.pick(PROCESSOR), processor), (l.pick(RAM), fmt::ram(i.ram_kib))];
      if let Some(design) = i.battery.as_ref().and_then(|b| b.design) {
-@@ -587,7 +597,7 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
+@@ -587,7 +607,7 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
      if let Some(p) = i.panel {
          specs.push((l.pick(RESOLUTION), fmt::panel(p)));
      }
@@ -1887,7 +3130,7 @@ index 1951193..9eb5ecb 100644
      let links = widgets::list_toned(c, t, f, y + m.card_gap, &[Row::new(l.pick(SPECS)), Row::new(l.pick(LOGS))], &tone);
      out.extend(hits(&links.rows, &[Action::Open(Screen::Specs), Action::Open(Screen::Logs)]));
      (out, summary.rows[0].y, links.bottom)
-@@ -938,6 +948,19 @@ pub fn install(cx: &Ctx) -> Frame {
+@@ -938,6 +958,19 @@ pub fn install(cx: &Ctx) -> Frame {
          ]);
          y = widgets::footnote(&mut c, t, f, options.bottom, note);
      }
@@ -1907,6 +3150,436 @@ index 1951193..9eb5ecb 100644
      Frame::new(t, fit(c, t, y), out, l.pick(["安装", "安裝", "Install"]), top)
  }
  
+@@ -2880,8 +2913,11 @@ pub fn wlan(cx: &Ctx) -> Frame {
+     let mut out = Vec::new();
+     let top = t.m.content_top;
+     let on = !matches!(w.power, Power::Off | Power::Failed(_));
+-    let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).trail(Trail::Switch(on))]);
+-    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
++    let switch = widgets::list(&mut c, t, f, top, &[
++        Row::new(l.pick(WLAN)).trail(Trail::Switch(on)),
++        Row::new(l.pick(network::ADVANCED)),
++    ]);
++    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan), Action::Open(Screen::WlanAdvanced)]));
+     let mut y = switch.bottom;
+     match &w.power {
+         Power::Off => {
+@@ -4089,3 +4125,5 @@ mod tests {
+         assert_eq!(capitalized(Lang::Hans, "清空 data 分区"), "清空 data 分区");
+     }
+ }
++mod network;
++mod browser;
+diff --git a/crates/skyward-ui/src/pages/browser.rs b/crates/skyward-ui/src/pages/browser.rs
+new file mode 100644
+index 0000000..eee8ac2
+--- /dev/null
++++ b/crates/skyward-ui/src/pages/browser.rs
+@@ -0,0 +1,45 @@
++use super::*;
++use crate::app::{browser_viewport, BrowserEdit};
++pub(super) const TITLE: Text = ["浏览器", "瀏覽器", "Browser"];
++
++pub(super) fn page(cx: &Ctx) -> Frame {
++    let (t,f,s,l)=(cx.t,cx.f,&cx.state.browser,cx.state.lang);
++    let mut c=super::page(cx);
++    let label=if s.url.is_empty() || s.url.starts_with("file:") { l.pick(["输入网址", "輸入網址", "Enter web address"]) } else { &s.url };
++    let address=widgets::list(&mut c,t,f,t.m.content_top,&[Row::new(label).trail(Trail::Arrow)]);
++    let mut out=hits(&address.rows,&[Action::BrowserAddress]);
++    let r=browser_viewport(t);
++    c.fill_rect(r.x,r.y,r.w,r.h,Rgba{r:255,g:255,b:255,a:255});
++    if let Some(p)=&s.frame { c.image_rgba(r,p.w,p.h,&p.rgba); }
++    if let Some(error)=&s.error {
++        let title=l.pick(["网页未能打开", "網頁無法開啟", "Couldn't open the page"]);
++        let list=widgets::list(&mut c,t,f,r.y+t.m.margin,&[Row::new(title).subtitle(error).trail(Trail::None),Row::new(l.pick(["重试", "重試", "Retry"]))]);
++        out.extend(hits(&list.rows[1..],&[Action::BrowserReload]));
++    } else if s.frame.is_none() {
++        widgets::list(&mut c,t,f,r.y+t.m.margin,&[Row::new(l.pick(["正在启动浏览器…", "正在啟動瀏覽器…", "Starting browser…"])).trail(Trail::None)]);
++    }
++    let note=if !s.download.is_empty() { &s.download } else if s.loading { l.pick(["正在加载…", "正在載入…", "Loading…"]) } else { &s.title };
++    // A separate strip keeps progress outside the webpage's touch region.
++    c.fill_rect(0.0,r.y+r.h,t.m.w as f32,t.m.dp(32.0),t.pal.bg);
++    c.text(&f.value,note,t.m.margin,r.y+r.h+t.m.dp(22.0),t.m.sub_px,t.pal.subtitle,Some(t.m.w as f32-2.0*t.m.margin));
++    let labels=[l.pick(["后退", "上一頁", "Back"]),l.pick(["前进", "下一頁", "Forward"]),l.pick(["刷新", "重新整理", "Reload"]),l.pick(["键盘", "鍵盤", "Keyboard"]),l.pick(["下载", "下載", "Downloads"])];
++    let (canvas,rects)=widgets::dock_bar(t,f,t.pal.bg,&labels);
++    let dock=Dock{canvas,hits:hits(&rects,&[Action::BrowserBack,Action::BrowserForward,Action::BrowserReload,Action::BrowserKeyboard,Action::BrowserDownloads])};
++    let c=c.crop_height(t.m.h.saturating_sub(dock.canvas.h));
++    Frame{dock:Some(dock),..Frame::new(t,c,out,l.pick(TITLE),t.m.content_top)}
++}
++
++pub(super) fn input(cx: &Ctx) -> Frame {
++    let (t,f,s,l)=(cx.t,cx.f,&cx.state.browser,cx.state.lang);
++    let address=s.edit==BrowserEdit::Address;
++    let title=l.pick(if address {["网址", "網址", "Web address"]} else {["网页输入", "網頁輸入", "Page input"]});
++    let mut c=super::page(cx);
++    let mut out=Vec::new();
++    let y=widgets::section_first(&mut c,t,f,t.m.content_top,title);
++    let text=if matches!(s.edit,BrowserEdit::Field{secret:true}) { "•".repeat(s.input.chars().count()) } else { s.input.clone() };
++    let(y,caret)=widgets::text_field(&mut c,t,f,y,&text);
++    let list=widgets::list(&mut c,t,f,y+t.m.card_gap,&[Row::new(l.pick(["清空", "清除", "Clear"]))]);
++    out.extend(hits(&list.rows,&[Action::BrowserClear]));
++    keyboard_hits(&mut c,t,f,cx.state,l.pick(if address {["打开", "開啟", "Go"]} else {["完成", "完成", "Done"]}),&mut out);
++    Frame{caret:Some(caret),..Frame::new(t,c,out,title,t.m.content_top)}
++}
+diff --git a/crates/skyward-ui/src/pages/network.rs b/crates/skyward-ui/src/pages/network.rs
+new file mode 100644
+index 0000000..4287761
+--- /dev/null
++++ b/crates/skyward-ui/src/pages/network.rs
+@@ -0,0 +1,159 @@
++use super::*;
++use skyward_net::network::ProxyKind;
++
++pub(super) const ADVANCED: Text = ["高级网络设置", "進階網路設定", "Advanced network settings"];
++const PROXY: Text = ["代理", "代理伺服器", "Proxy"];
++const AUTO: Text = ["自动获取", "自動取得", "Automatic"];
++const MANUAL: Text = ["手动", "手動", "Manual"];
++const SAVE: Text = ["保存", "儲存", "Save"];
++
++fn preview(c: &Canvas, t: &Theme, f: &Fonts, text: &str) -> String {
++    let m = &t.m;
++    let max = (m.w as f32 - m.margin * 2.0 - m.inner * 2.0) * 0.45;
++    if c.text_width(&f.value, text, m.sub_px) <= max { return text.to_string(); }
++    let limit = max - c.text_width(&f.value, "…", m.sub_px);
++    let (mut width, mut out) = (0.0, String::new());
++    for ch in text.chars() {
++        let advance = c.text_width(&f.value, &ch.to_string(), m.sub_px);
++        if width + advance > limit { break; }
++        width += advance;
++        out.push(ch);
++    }
++    out.push('…');
++    out
++}
++
++fn proxy_name(l: Lang, kind: ProxyKind) -> &'static str {
++    match kind {
++        ProxyKind::None => l.pick(["无", "無", "None"]),
++        ProxyKind::Http => "HTTP CONNECT",
++        ProxyKind::Socks5 => "SOCKS5",
++    }
++}
++
++fn save_dock(t: &Theme, f: &Fonts, l: Lang) -> Dock {
++    let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(SAVE)]);
++    Dock { canvas, hits: hits(&rects, &[Action::SaveNetwork]) }
++}
++
++pub(super) fn advanced(cx: &Ctx) -> Frame {
++    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
++    let mut c = long_page(cx);
++    let dns_value = preview(&c, t, f, if s.network.dns.manual { &s.network.dns.primary } else { l.pick(AUTO) });
++    let rows = [
++        Row::new(l.pick(PROXY)).trail(Trail::Value(proxy_name(l, s.network.proxy.kind))),
++        Row::new("DNS").trail(Trail::Value(&dns_value)),
++    ];
++    let list = widgets::list(&mut c, t, f, t.m.content_top, &rows);
++    let out = hits(&list.rows, &[Action::Open(Screen::WlanProxy), Action::Open(Screen::WlanDns)]);
++    let y = widgets::footnote(&mut c, t, f, list.bottom,
++        l.pick(["用于 Recovery 的联网检测和下载，保存后对新请求生效。",
++            "用於 Recovery 的連線檢查和下載，儲存後對新要求生效。",
++            "Used for Recovery connectivity checks and downloads. Saved changes apply to new requests."]));
++    Frame::new(t, fit(c, t, y), out, l.pick(ADVANCED), t.m.content_top)
++}
++
++pub(super) fn proxy(cx: &Ctx) -> Frame {
++    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
++    let proxy = &s.network_draft.as_ref().expect("proxy preferences").settings.proxy;
++    let mut c = long_page(cx);
++    let kinds = [ProxyKind::None, ProxyKind::Http, ProxyKind::Socks5];
++    let rows = kinds.map(|kind| Row::new(proxy_name(l, kind)).trail(Trail::Check(proxy.kind == kind)));
++    let list = widgets::list(&mut c, t, f, t.m.content_top, &rows);
++    let mut out = hits(&list.rows, &kinds.map(Action::ChooseProxy));
++    let mut y = list.bottom;
++    if proxy.kind != ProxyKind::None {
++        let fields = [NetworkField::ProxyServer, NetworkField::ProxyPort, NetworkField::ProxyUsername, NetworkField::ProxyPassword];
++        let values = [
++            if proxy.server.is_empty() { l.pick(["未设置", "尚未設定", "Not set"]).into() } else { proxy.server.clone() },
++            proxy.port.to_string(),
++            if proxy.username.is_empty() { l.pick(["可选", "選填", "Optional"]).into() } else { proxy.username.clone() },
++            if proxy.password.is_empty() { l.pick(["可选", "選填", "Optional"]).into() } else { "•".repeat(proxy.password.chars().count().min(12)) },
++        ];
++        let values: Vec<_> = values.iter().map(|value| preview(&c, t, f, value)).collect();
++        let rows: Vec<Row> = fields.iter().zip(&values).map(|(field, value)| Row::new(field.title(l)).trail(Trail::Value(value))).collect();
++        let list = widgets::list(&mut c, t, f, y + t.m.card_gap, &rows);
++        out.extend(hits(&list.rows, &fields.map(Action::EditNetwork)));
++        y = widgets::footnote(&mut c, t, f, list.bottom,
++            l.pick(["用户名和密码仅在代理服务器要求认证时填写。", "代理伺服器需要驗證時才填寫使用者名稱和密碼。",
++                "Enter a username and password when your proxy requires authentication."]));
++    }
++    Frame { dock: Some(save_dock(t, f, l)), ..Frame::new(t, fit(c, t, y), out, l.pick(PROXY), t.m.content_top) }
++}
++
++pub(super) fn dns(cx: &Ctx) -> Frame {
++    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
++    let dns = &s.network_draft.as_ref().expect("DNS preferences").settings.dns;
++    let mut c = long_page(cx);
++    let rows = [Row::new(l.pick(AUTO)).trail(Trail::Check(!dns.manual)), Row::new(l.pick(MANUAL)).trail(Trail::Check(dns.manual))];
++    let list = widgets::list(&mut c, t, f, t.m.content_top, &rows);
++    let mut out = hits(&list.rows, &[Action::ManualDns(false), Action::ManualDns(true)]);
++    let mut y = list.bottom;
++    if dns.manual {
++        let fields = [NetworkField::DnsPrimary, NetworkField::DnsSecondary];
++        let values = [
++            if dns.primary.is_empty() { l.pick(["未设置", "尚未設定", "Not set"]).into() } else { dns.primary.clone() },
++            if dns.secondary.is_empty() { l.pick(["可选", "選填", "Optional"]).into() } else { dns.secondary.clone() },
++        ];
++        let values: Vec<_> = values.iter().map(|value| preview(&c, t, f, value)).collect();
++        let rows: Vec<Row> = fields.iter().zip(&values).map(|(field, value)| Row::new(field.title(l)).trail(Trail::Value(value))).collect();
++        let list = widgets::list(&mut c, t, f, y + t.m.card_gap, &rows);
++        out.extend(hits(&list.rows, &fields.map(Action::EditNetwork)));
++        y = list.bottom;
++    }
++    y = widgets::footnote(&mut c, t, f, y, l.pick([
++        "自动获取使用当前网络分配的 DNS。手动设置支持 IPv4 和 IPv6 服务器地址。",
++        "自動取得會使用目前網路分配的 DNS。手動設定支援 IPv4 和 IPv6 伺服器位址。",
++        "Automatic uses DNS servers supplied by the network. Manual accepts IPv4 and IPv6 server addresses."]));
++    Frame { dock: Some(save_dock(t, f, l)), ..Frame::new(t, fit(c, t, y), out, "DNS", t.m.content_top) }
++}
++
++pub(super) fn input(cx: &Ctx) -> Frame {
++    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
++    let draft = s.network_draft.as_ref().expect("network input");
++    let field = draft.field.expect("network field");
++    let mut c = page(cx);
++    let mut out = Vec::new();
++    let y = widgets::section_first(&mut c, t, f, t.m.content_top, field.title(l));
++    let password = field == NetworkField::ProxyPassword;
++    let shown = if password && !s.show_password { "•".repeat(draft.text.chars().count()) } else { draft.text.clone() };
++    let (mut y, caret) = widgets::text_field(&mut c, t, f, y, &shown);
++    if password {
++        let list = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).trail(Trail::Switch(s.show_password))]);
++        out.extend(hits(&list.rows, &[Action::Toggle(Switch::ShowPassword)]));
++        y = list.bottom;
++    }
++    let hint = l.pick(match field {
++        NetworkField::ProxyServer => ["例如 192.168.1.2 或 proxy.example.com", "例如 192.168.1.2 或 proxy.example.com", "For example, 192.168.1.2 or proxy.example.com"],
++        NetworkField::ProxyPort => ["有效范围为 1 到 65535", "有效範圍為 1 到 65535", "Valid ports range from 1 to 65535"],
++        NetworkField::ProxyUsername | NetworkField::ProxyPassword => ["代理服务器要求认证时填写", "代理伺服器需要驗證時填寫", "Use when the proxy requires authentication"],
++        NetworkField::DnsPrimary => ["输入 IPv4 或 IPv6 地址，例如 1.1.1.1", "輸入 IPv4 或 IPv6 位址，例如 1.1.1.1", "Enter an IPv4 or IPv6 address, such as 1.1.1.1"],
++        NetworkField::DnsSecondary => ["可留空；首选服务器无法响应时使用", "可以留白；慣用伺服器無回應時使用", "Optional; used when the primary server cannot answer"],
++    });
++    widgets::footnote(&mut c, t, f, y, hint);
++    keyboard_hits(&mut c, t, f, s, l.pick(["完成", "完成", "Done"]), &mut out);
++    Frame { caret: Some(caret), ..Frame::new(t, c, out, field.title(l), t.m.content_top) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::app::App;
++
++    #[test]
++    fn long_network_values_keep_their_labels_room() {
++        let fonts = crate::font::bundled();
++        let app = App::new(Screen::WlanProxy, 1600, 2560, 2.25);
++        let theme = app.theme();
++        let canvas = Canvas::new(1600, 2560);
++        let host = format!("{}.{}.{}.example.com", "a".repeat(63), "b".repeat(63), "c".repeat(63));
++        let username = "u".repeat(255);
++        for original in [host.as_str(), username.as_str(), "2606:4700:4700:0000:0000:0000:0000:1111"] {
++            let shown = preview(&canvas, &theme, &fonts, original);
++            let max = (theme.m.w as f32 - theme.m.margin * 2.0 - theme.m.inner * 2.0) * 0.45;
++            assert!(canvas.text_width(&fonts.value, &shown, theme.m.sub_px) <= max + 1.0);
++            assert!(!shown.is_empty());
++        }
++        assert_eq!(preview(&canvas, &theme, &fonts, "1.1.1.1"), "1.1.1.1");
++    }
++}
+diff --git a/crates/skyward-ui/src/search.rs b/crates/skyward-ui/src/search.rs
+index 85bf8b2..4756c10 100644
+--- a/crates/skyward-ui/src/search.rs
++++ b/crates/skyward-ui/src/search.rs
+@@ -115,6 +115,9 @@ pub const ENTRIES: &[Entry] = &[
+     partition("vendor_dlkm", MOUNT, Screen::Mount),
+     partition("system_dlkm", MOUNT, Screen::Mount),
+     partition("odm_dlkm", MOUNT, Screen::Mount),
++    entry(["高级网络设置", "進階網路設定", "Advanced network settings"], ["WLAN", "Wi-Fi", "Wi-Fi"], Screen::WlanAdvanced, &["gaojiwangluo", "gjwl", "network"]),
++    entry(["代理", "代理伺服器", "Proxy"], ["WLAN", "Wi-Fi", "Wi-Fi"], Screen::WlanProxy, &["daili", "dl", "proxy", "socks", "socks5"]),
++    entry(["DNS", "DNS", "DNS"], ["WLAN", "Wi-Fi", "Wi-Fi"], Screen::WlanDns, &["dns", "yumingjiexi", "ymjx"]),
+ ];
+ 
+ /// The entries `query` finds, best first: a title in `l` holding it, then a
+diff --git a/crates/skyward-ui/src/settings.rs b/crates/skyward-ui/src/settings.rs
+index 294515b..d8123e3 100644
+--- a/crates/skyward-ui/src/settings.rs
++++ b/crates/skyward-ui/src/settings.rs
+@@ -52,6 +52,7 @@ pub struct Settings {
+     pub install: Install,
+     pub backup: Backup,
+     pub logs: Logs,
++    pub network: skyward_net::network::Settings,
+ }
+ 
+ /// The install page's options.
+@@ -138,6 +139,7 @@ impl Settings {
+                 verify: state.verify,
+             },
+             logs: Logs { kinds: names(&state.logs, &LOGS), to: LOG_PLACES[state.logs_to].to_string() },
++            network: state.network.clone(),
+         }
+     }
+ 
+@@ -184,6 +186,9 @@ impl Settings {
+             state.vibration = self.vibration;
+         }
+         state.file_transfer = self.file_transfer;
++        if self.network.validate().is_ok() {
++            state.network = self.network.clone();
++        }
+         state.check_signature = self.install.check_signature;
+         state.keep_recovery = self.install.keep_recovery;
+         state.backup = picked(&self.backup.parts, &PARTS);
+@@ -214,7 +219,7 @@ fn picked<const N: usize>(kept: &[String], all: &[&str; N]) -> [bool; N] {
+ /// What the settings file held as the recovery started.
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Kept {
+-    Settings(Settings),
++    Settings(Box<Settings>),
+     /// No settings: no file, or one that does not read as settings.
+     Nothing,
+     /// Where the file is could not be read; it is left alone this time.
+@@ -246,7 +251,7 @@ pub struct Keeper {
+ impl Keeper {
+     pub fn new(kept: &Kept) -> Keeper {
+         let holds = match kept {
+-            Kept::Settings(settings) => Some(Some(settings.clone())),
++            Kept::Settings(settings) => Some(Some(settings.as_ref().clone())),
+             Kept::Nothing => Some(None),
+             Kept::Unreadable => None,
+         };
+@@ -375,7 +380,7 @@ mod tests {
+ 
+     #[test]
+     fn changed_settings_are_written_once_they_have_stood_for_a_moment() {
+-        let mut keeper = Keeper::new(&Kept::Settings(Settings::default()));
++        let mut keeper = Keeper::new(&Kept::Settings(Box::new(Settings::default())));
+         assert_eq!(keeper.due(Settings::default(), 0), None, "what the file holds is not written again");
+         let dark = Settings { dark: true, ..Settings::default() };
+         assert_eq!(keeper.due(dark.clone(), 1_000), None);
+diff --git a/crates/skyward-ui/src/surface.rs b/crates/skyward-ui/src/surface.rs
+index ab27c29..626b005 100644
+--- a/crates/skyward-ui/src/surface.rs
++++ b/crates/skyward-ui/src/surface.rs
+@@ -723,9 +723,14 @@ pub mod kms {
+                 spr.as_ref().map(|(_, _, name)| format!(", sub-pixel rendering through {name}")).unwrap_or_default()
+             );
+             let spr = spr.map(|(id, setup, _)| (id, setup));
++            // WLED LCDs expose the LP property, but their video pipeline
++            // needs a complete power-down rather than an OLED doze state.
++            let wled = conn_props.get("capabilities").ok()
++                .and_then(|(_, blob)| card.get_property_blob(blob).ok())
++                .is_some_and(|blob| String::from_utf8_lossy(&blob).contains("backlight type=wled"));
+             let lp = match conn_props.get("LP") {
+-                Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
+-                Err(_) => None,
++                Ok((id, _)) if !wled => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
++                _ => None,
+             };
+             let conn = conn.handle();
+             let s = KmsSurface {
+diff --git a/crates/skyward/Cargo.toml b/crates/skyward/Cargo.toml
+index c653811..84242d5 100644
+--- a/crates/skyward/Cargo.toml
++++ b/crates/skyward/Cargo.toml
+@@ -9,6 +9,8 @@ name = "skyward"
+ path = "src/main.rs"
+ 
+ [dependencies]
++serde = { workspace = true }
++serde_json = "1.0.154"
+ anyhow = { workspace = true }
+ clap = { version = "4.5.51", features = ["derive"] }
+ skyward-config = { path = "../skyward-config" }
+diff --git a/crates/skyward/src/browser.rs b/crates/skyward/src/browser.rs
+new file mode 100644
+index 0000000..cc88ccf
+--- /dev/null
++++ b/crates/skyward/src/browser.rs
+@@ -0,0 +1,83 @@
++//! WPE's isolated process, input pipe and exported webpage frames.
++use anyhow::{Context, Result, ensure};
++use serde_json::{Value, json};
++use skyward_net::http::Servers;
++use skyward_net::network::ProxyKind;
++use skyward_ui::app::{BrowserCommand, BrowserPixels};
++use std::fs::{self, OpenOptions};
++use std::io::{BufRead, BufReader, Read, Write};
++use std::os::fd::RawFd;
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++use std::os::unix::process::CommandExt;
++use std::path::Path;
++use std::process::{Child, ChildStdin, Command, Stdio};
++use std::sync::Arc;
++
++pub const RUNNER: &str = "/system/bin/skyward-browser";
++const ROOT: &str = "/data/skyward/browser/root";
++const DOWNLOADS: &str = "/sdcard/Download/Skyward";
++pub enum Event { Message(Value), Frame(Arc<BrowserPixels>), Ended }
++pub struct Browser { child: Child, input: ChildStdin, reader: skyward_sys::worker::Worker<Event> }
++impl Browser {
++    pub fn start(w: u32,h: u32,servers: &Servers) -> Result<Self> {
++        ensure!(Path::new(ROOT).join("opt/wpe/browser").is_file(), "浏览器组件未安装，请安装 skyward-browser-runtime.zip 后重试");
++        fs::create_dir_all(DOWNLOADS).context("create the browser download directory")?;
++        // Only this browser-owned subdirectory is exposed to the engine.
++        let downloads=std::ffi::CString::new(DOWNLOADS)?;
++        ensure!(unsafe {libc::chown(downloads.as_ptr(),65534,1023)}==0, "set browser download ownership");
++        fs::set_permissions(DOWNLOADS,fs::Permissions::from_mode(0o775))?;
++        let state=servers.lock().expect("the network preferences lock");
++        let dns=state.dns_servers();
++        let resolver=dns.iter().map(|ip|format!("nameserver {ip}\n")).collect::<String>();
++        fs::write(Path::new(ROOT).join("etc/resolv.conf"),format!("{resolver}options timeout:2 attempts:2\n"))?;
++        let p=&state.settings.proxy;
++        let host=if p.server.contains(':'){format!("[{}]",p.server)}else{p.server.clone()};
++        let proxy=match p.kind {ProxyKind::None=>String::new(),ProxyKind::Http=>format!("http://{host}:{}",p.port),ProxyKind::Socks5=>format!("socks5://{host}:{}",p.port)};
++        let config=json!({"cmd":"configure","proxy":proxy,"username":p.username,"password":p.password});
++        drop(state);
++        let log=OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open("/tmp/skyward-browser.log")?;
++        let mut command=Command::new(RUNNER);
++        command.args([ROOT,DOWNLOADS,&w.to_string(),&h.to_string()]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log);
++        unsafe { command.pre_exec(|| { if libc::setpgid(0,0)!=0 {return Err(std::io::Error::last_os_error());} Ok(()) }); }
++        let mut child=command.spawn().context("start WPE WebKit")?;
++        let input=child.stdin.take().context("browser input")?;
++        let output=child.stdout.take().context("browser output")?;
++        let reader=skyward_sys::worker::Worker::start("browser",move |tell| {
++            for line in BufReader::new(output).lines() {
++                let Ok(line)=line else {break};
++                if line.len()>65536 {continue;}
++                let Ok(value)=serde_json::from_str::<Value>(&line) else {continue};
++                if value["event"]=="frame" {
++                    if let Ok(p)=read_frame(&value) {tell.tell(Event::Frame(Arc::new(p)));}
++                } else {tell.tell(Event::Message(value));}
++            }
++            tell.tell(Event::Ended);
++        });
++        let reader=match reader {Ok(reader)=>reader,Err(e)=>{unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}let _=child.wait();return Err(e)}};
++        let mut browser=Self{child,input,reader};
++        browser.send_value(&config)?;
++        Ok(browser)
++    }
++    pub fn fd(&self)->RawFd {self.reader.fd()}
++    pub fn events(&self)->Vec<Event> {self.reader.events()}
++    fn send_value(&mut self,value:&impl serde::Serialize)->Result<()> {
++        serde_json::to_writer(&mut self.input,value)?;self.input.write_all(b"\n")?;Ok(())
++    }
++    pub fn send(&mut self,command:&BrowserCommand)->Result<()> {self.send_value(command)}
++}
++impl Drop for Browser {
++    fn drop(&mut self) {
++        unsafe{libc::kill(-(self.child.id() as i32),libc::SIGKILL);}
++        let _=self.child.wait();
++    }
++}
++fn read_frame(v:&Value)->Result<BrowserPixels> {
++    let w=v["w"].as_u64().unwrap_or(0);let h=v["h"].as_u64().unwrap_or(0);let stride=v["stride"].as_u64().unwrap_or(0);
++    ensure!((200..=1600).contains(&w)&&(200..=2560).contains(&h)&&stride>=w*4&&stride<=w*4+256,"invalid browser frame");
++    let mut f=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(Path::new(ROOT).join("output/view.bgra"))?;
++    ensure!(f.metadata()?.is_file()&&f.metadata()?.len()==stride*h,"incomplete browser frame");
++    let mut bgra=vec![0u8;(stride*h) as usize];f.read_exact(&mut bgra)?;
++    let mut rgba=Vec::with_capacity((w*h*4) as usize);
++    for row in bgra.chunks_exact(stride as usize) {for px in row[..w as usize*4].as_chunks::<4>().0 {rgba.extend_from_slice(&[px[2],px[1],px[0],255]);}}
++    Ok(BrowserPixels{w:w as u32,h:h as u32,rgba})
++}
 diff --git a/crates/skyward/src/keys.rs b/crates/skyward/src/keys.rs
 index f4b7775..ac4bff2 100644
 --- a/crates/skyward/src/keys.rs
@@ -1936,10 +3609,19 @@ index f4b7775..ac4bff2 100644
  
  /// The phone as the partitions of the slot's installed system describe it,
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index c770fe4..2d81930 100644
+index c770fe4..c5163ee 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
-@@ -57,6 +57,19 @@ struct Cli {
+@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
+ #[cfg(target_os = "android")]
+ mod backup;
+ #[cfg(target_os = "android")]
++mod browser;
++#[cfg(target_os = "android")]
+ mod decrypt;
+ #[cfg(target_os = "android")]
+ mod filework;
+@@ -57,6 +59,19 @@ struct Cli {
  
  #[derive(Subcommand)]
  enum Cmd {
@@ -1959,7 +3641,7 @@ index c770fe4..2d81930 100644
      /// Print what the About page shows, plus a partition summary.
      Info {
          /// Device configuration, e.g. devices/nezha.toml.
-@@ -236,6 +249,22 @@ fn main() -> Result<()> {
+@@ -236,6 +251,22 @@ fn main() -> Result<()> {
          std::process::exit(code);
      }
      match Cli::parse().cmd {
@@ -1982,7 +3664,7 @@ index c770fe4..2d81930 100644
          Cmd::Info { config } => info(&config),
          Cmd::Slot => slot(),
          Cmd::Modules { source } => modules(&source),
-@@ -534,7 +563,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -534,7 +565,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      // The drivers ask for their firmware by name, and the kernel looks only
      // in folders of its own unless told to pass on what it does not find
      // there to ueventd, which looks in the recovery's firmware folders.
@@ -1997,7 +3679,7 @@ index c770fe4..2d81930 100644
      if let Some(firmware) = &cfg.firmware {
          mount_firmware(&firmware.partition)?;
      }
-@@ -551,16 +586,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -551,16 +588,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      }
      // What the phone describes is known wherever its partitions could be
      // read at all; what they say of its keys may still not be.
@@ -2021,7 +3703,7 @@ index c770fe4..2d81930 100644
      if !hardware.is_empty() {
          secure::prepare_hardware_directory(&hardware)?;
          skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
-@@ -575,7 +613,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -575,7 +615,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      if found.as_deref().is_ok_and(keys::serves_elements) {
          registering.push(skyward_omapi::SERVICE.to_string());
      }
@@ -2030,7 +3712,7 @@ index c770fe4..2d81930 100644
      // A program may register more than the recovery waits for, as the
      // WLAN's supplicant registers its maker's own service beside
      // Android's, and ends where the directory turns one of them away. So
-@@ -597,7 +635,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -597,7 +637,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
          skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
      }
      keys::start(&steps)?;
@@ -2041,7 +3723,7 @@ index c770fe4..2d81930 100644
  }
  
  /// How long a file handed over may take to be there once the modules are
-@@ -667,9 +707,12 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
+@@ -667,9 +709,12 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
  /// credential service cannot write a note the key service will take, and
  /// the keys the phone guards behind a screen lock stay unusable.
  #[cfg(target_os = "android")]
@@ -2084,11 +3766,46 @@ index deefa91..85f76a1 100644
          let (package, rest) = name
              .split_once('@')
              .with_context(|| format!("{name} does not read as a hardware service's name"))?;
+diff --git a/crates/skyward/src/settings.rs b/crates/skyward/src/settings.rs
+index ad36bfb..245743d 100644
+--- a/crates/skyward/src/settings.rs
++++ b/crates/skyward/src/settings.rs
+@@ -10,6 +10,7 @@ use skyward_ui::settings::{Kept, Settings};
+ use std::fs::{self, File};
+ use std::io::{ErrorKind, Write};
+ use std::path::Path;
++use std::os::unix::fs::PermissionsExt;
+ 
+ const METADATA: &str = "/metadata";
+ const FOLDER: &str = "/metadata/skyward";
+@@ -32,7 +33,7 @@ pub fn read() -> Result<Kept> {
+ fn read_file() -> Result<Kept> {
+     match fs::read_to_string(FILE) {
+         Ok(text) => match Settings::read(&text) {
+-            Ok(settings) => Ok(Kept::Settings(settings)),
++            Ok(settings) => Ok(Kept::Settings(Box::new(settings))),
+             Err(e) => {
+                 skyward_sys::kmsg(&format!("{FILE} does not read as settings, and is written afresh: {e:#}"))?;
+                 Ok(Kept::Nothing)
+@@ -58,6 +59,7 @@ pub fn write(settings: &Settings) -> Result<()> {
+ fn write_file(settings: &Settings) -> Result<()> {
+     fs::create_dir_all(FOLDER).with_context(|| format!("make {FOLDER}"))?;
+     let mut file = File::create(WRITING).with_context(|| format!("make {WRITING}"))?;
++    file.set_permissions(fs::Permissions::from_mode(0o600)).context("protect saved settings")?;
+     file.write_all(settings.text().as_bytes()).with_context(|| format!("write {WRITING}"))?;
+     file.sync_all().with_context(|| format!("write {WRITING}"))?;
+     fs::rename(WRITING, FILE).with_context(|| format!("move {WRITING} over {FILE}"))?;
 diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
-index 8ed3ceb..7a46fdd 100644
+index 8ed3ceb..f0cda49 100644
 --- a/crates/skyward/src/ui.rs
 +++ b/crates/skyward/src/ui.rs
-@@ -18,7 +18,7 @@ use crate::wlan;
+@@ -1,4 +1,5 @@
+ use crate::backup;
++use crate::browser;
+ use crate::decrypt::{self, Decryptor};
+ use crate::filework;
+ use crate::haptics::Haptics;
+@@ -18,7 +19,7 @@ use crate::wlan;
  use anyhow::{anyhow, ensure, Context, Result};
  use skyward_block::fsck::Fixed;
  use skyward_block::{fstab, mount, probe};
@@ -2097,7 +3814,16 @@ index 8ed3ceb..7a46fdd 100644
  use skyward_crypto::data::{Closed, Opened};
  use skyward_install::asked::{self, Needs};
  use skyward_install::{Detach, Installer, Options};
-@@ -87,6 +87,7 @@ struct Backlight {
+@@ -35,7 +36,7 @@ use skyward_sys::sleep::{Sleeper, Slept};
+ use skyward_sys::uevent;
+ use skyward_systems::Who;
+ use skyward_ui::app::{
+-    App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
++    App, Asked, BrowserCommand, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
+     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
+     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
+     INSTALL_UNFINISHED, USB_DRIVE,
+@@ -87,6 +88,7 @@ struct Backlight {
      top: u32,
      /// The raw level last written; at first the one the bootloader left.
      level: u32,
@@ -2105,7 +3831,7 @@ index 8ed3ceb..7a46fdd 100644
  }
  
  impl Backlight {
-@@ -112,17 +113,18 @@ impl Backlight {
+@@ -112,17 +114,18 @@ impl Backlight {
          };
          let top = normal_max(read("max_brightness")?)?;
          let level = read("brightness")?;
@@ -2126,7 +3852,7 @@ index 8ed3ceb..7a46fdd 100644
          }
          Ok(())
      }
-@@ -155,28 +157,58 @@ fn normal_max(max: u32) -> Result<u32> {
+@@ -155,28 +158,58 @@ fn normal_max(max: u32) -> Result<u32> {
      // without the colon either.
      let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
      let soc = Path::new("/proc/device-tree/soc");
@@ -2196,7 +3922,23 @@ index 8ed3ceb..7a46fdd 100644
  /// Leave recovery for the chosen target.
  fn power(target: Target) -> Result<()> {
      skyward_sys::power(match target {
-@@ -1341,6 +1373,7 @@ impl<'a> Pages<'a> {
+@@ -1216,6 +1249,7 @@ struct Pages<'a> {
+     skyward_updater: Option<updates::Worker>,
+     /// The terminal page's shell, from when the page first asks for one.
+     shell: Option<pty::Shell>,
++    browser: Option<browser::Browser>,
+     /// The USB drive plugged in, looked for each second.
+     plugged: Option<Plugged>,
+     seen: Option<String>,
+@@ -1275,6 +1309,7 @@ impl<'a> Pages<'a> {
+         };
+         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
+         app.set_screen_corners(cfg.display.corner_radius as f32);
++        app.state.browser.enabled = Path::new(browser::RUNNER).exists();
+         // The settings kept from the starts before are back before the first
+         // frame, and before file transfer starts with its switch and the time
+         // zone. The pages speak the language chosen then, or else the one the
+@@ -1341,6 +1376,7 @@ impl<'a> Pages<'a> {
          let by_name = Path::new(skyward_block::BY_NAME);
          let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
          app.state.recovery_partitions = both("recovery")?;
@@ -2204,7 +3946,34 @@ index 8ed3ceb..7a46fdd 100644
          app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
          // The second system's work; the systems are read at once, for the home
          // page to name the one that starts, once a switch cut off before is
-@@ -1510,6 +1543,16 @@ impl<'a> Pages<'a> {
+@@ -1365,6 +1401,9 @@ impl<'a> Pages<'a> {
+                 app.report(&format!("{e:#}"), monotonic_ms());
+             }
+         }
++        let servers = Arc::new(Mutex::new(skyward_net::network::State {
++            settings: app.state.network.clone(), ..Default::default()
++        }));
+         Ok(Pages {
+             cfg,
+             programs,
+@@ -1414,7 +1453,7 @@ impl<'a> Pages<'a> {
+             systems_worker,
+             switch_asked: false,
+             switched: false,
+-            servers: Arc::new(Mutex::new(Vec::new())),
++            servers,
+             wlan: None,
+             scanned_at: Instant::now(),
+             checker: None,
+@@ -1422,6 +1461,7 @@ impl<'a> Pages<'a> {
+             skyward_checker: None,
+             skyward_updater: None,
+             shell: None,
++            browser: None,
+             plugged: None,
+             seen: None,
+             drive_at: Instant::now(),
+@@ -1510,6 +1550,16 @@ impl<'a> Pages<'a> {
              }
              Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
          }
@@ -2221,7 +3990,89 @@ index 8ed3ceb..7a46fdd 100644
          // A switch asked for finishes one cut off before itself; fastboot leaves
          // /metadata to fastbootd until the recovery's pages come up.
          if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
-@@ -1714,7 +1757,7 @@ impl<'a> Pages<'a> {
+@@ -1607,6 +1657,7 @@ impl<'a> Pages<'a> {
+         self.skyward_told(now)?;
+         self.decrypt_told(now)?;
+         self.shell_told()?;
++        self.browser_told(now);
+         self.take_in(drive_told, now)?;
+         self.offer_storage(now)
+     }
+@@ -1631,6 +1682,73 @@ impl<'a> Pages<'a> {
+         Ok(())
+     }
+ 
++    fn browser_command(&mut self, command: BrowserCommand) {
++        match command {
++            BrowserCommand::Close => { self.browser = None; }
++            BrowserCommand::Open => {
++                if self.browser.is_some() { return; }
++                let viewport = skyward_ui::app::browser_viewport(&self.app.theme());
++                match browser::Browser::start(800, (viewport.h * 800.0 / viewport.w).round() as u32, &self.servers) {
++                    Ok(browser) => { self.browser = Some(browser); self.app.state.browser.running = true; }
++                    Err(e) => { self.app.state.browser.error = Some(format!("{e:#}")); self.app.state.browser.loading = false; }
++                }
++                self.app.browser_changed();
++            }
++            command => {
++                if let Some(browser) = &mut self.browser {
++                    if let Err(e) = browser.send(&command) { self.app.state.browser.error = Some(format!("{e:#}")); self.app.browser_changed(); }
++                    else if matches!(command, BrowserCommand::Navigate {..} | BrowserCommand::Reload | BrowserCommand::Back | BrowserCommand::Forward) {
++                        self.app.state.browser.error = None;
++                    }
++                } else if matches!(command, BrowserCommand::Reload) { self.browser_command(BrowserCommand::Open); }
++            }
++        }
++    }
++
++    fn browser_told(&mut self, now: u64) {
++        let Some(browser) = &self.browser else { return; };
++        let events = browser.events();
++        let mut changed = false;
++        for event in events {
++            match event {
++                browser::Event::Frame(frame) => { self.app.state.browser.frame = Some(frame); changed = true; }
++                browser::Event::Ended => {
++                    self.browser = None;
++                    self.app.state.browser.running = false;
++                    self.app.state.browser.loading = false;
++                    self.app.state.browser.error = Some("浏览器已停止，点按刷新重新打开".into());
++                    changed = true;
++                }
++                browser::Event::Message(v) => {
++                    let s = &mut self.app.state.browser;
++                    match v["event"].as_str().unwrap_or("") {
++                        "status" => {
++                            s.url = v["url"].as_str().unwrap_or("").into(); s.title = v["title"].as_str().unwrap_or("").into();
++                            s.loading = v["loading"].as_bool().unwrap_or(false); s.back = v["back"].as_bool().unwrap_or(false); s.forward = v["forward"].as_bool().unwrap_or(false);
++                            changed = true;
++                        }
++                        "error" => { s.error = Some(v["message"].as_str().unwrap_or("网页加载失败").into()); s.loading = false; changed = true; }
++                        "focus" => {
++                            let text = v["field"]["text"].as_str().unwrap_or("").to_owned();
++                            let secret = v["field"]["secret"].as_bool().unwrap_or(false);
++                            self.app.browser_field(text,secret);
++                        }
++                        "download" | "download_done" => {
++                            let done = v["event"] == "download_done";
++                            let name = v["name"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("");
++                            let percent = v["progress"].as_f64().unwrap_or(0.0) * 100.0;
++                            s.download = if done { format!("下载完成：{name}") } else { format!("下载中 {percent:.0}%：{name}") };
++                            changed = true;
++                        }
++                        _ => {}
++                    }
++                }
++            }
++        }
++        if changed { self.app.browser_changed(); }
++        let _ = now;
++    }
++
+     /// One click of the motor, as strong as the settings say.
+     fn click(&mut self) -> Result<()> {
+         if let Some(h) = &mut self.haptics {
+@@ -1714,7 +1832,7 @@ impl<'a> Pages<'a> {
          // After the frame is on the panel, so a panel coming back on lights
          // with what it should show now, never with what it showed when it
          // went off.
@@ -2230,7 +4081,23 @@ index 8ed3ceb..7a46fdd 100644
              self.surface.settle()?;
          }
          self.backlight.show(panel)?;
-@@ -2519,7 +2562,10 @@ impl Pages<'_> {
+@@ -1802,6 +1920,7 @@ impl<'a> Pages<'a> {
+         if let Some(s) = &self.systems_worker {
+             fds.push(s.fd());
+         }
++        if let Some(b) = &self.browser { fds.push(b.fd()); }
+         fds.push(self.readings.fd());
+         wait(&fds, timeout)
+     }
+@@ -1825,6 +1944,7 @@ impl<'a> Pages<'a> {
+             || self.downloader.is_some()
+             || self.skyward_checker.is_some()
+             || self.skyward_updater.is_some()
++            || self.browser.is_some()
+             || systems_busy;
+         let joining = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
+         let running = match &self.shell {
+@@ -2519,7 +2639,10 @@ impl Pages<'_> {
              }
              Effect::InstallPath(path) => {
                  if self.may_install(now)? {
@@ -2242,3 +4109,143 @@ index 8ed3ceb..7a46fdd 100644
                  }
              }
              Effect::Flash { partition, pick } => {
+@@ -2599,6 +2722,7 @@ impl Pages<'_> {
+                 skyward_sys::kmsg("merging the update, as the update page asked")?;
+                 self.merger = Some(merge::Merger::start(slot, true)?);
+             }
++            Effect::Browser(command) => self.browser_command(command),
+             Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
+             Effect::ScanWlan => {
+                 self.scanned_at = Instant::now();
+@@ -2608,6 +2732,12 @@ impl Pages<'_> {
+                 wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
+             }
+             Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
++            Effect::NetworkSettings(settings) => {
++                self.servers.lock().expect("network settings lock").settings = settings;
++                if let Some(wlan) = &self.wlan {
++                    wlan.send(wlan::Command::NetworkSettings);
++                }
++            }
+             Effect::CheckUpdate => self.check_update()?,
+             Effect::Download(release) => self.download(release, now)?,
+             Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
+diff --git a/crates/skyward/src/updates.rs b/crates/skyward/src/updates.rs
+index b5f0dae..8628627 100644
+--- a/crates/skyward/src/updates.rs
++++ b/crates/skyward/src/updates.rs
+@@ -213,8 +213,7 @@ impl Worker {
+ /// first, or reaches nothing, where `probe` shows it, rather than how
+ /// asking failed through such a network.
+ fn unanswered(e: &anyhow::Error, server: &str, probe: &str, servers: &Servers) -> Unanswered {
+-    let dns = servers.lock().expect("the DNS servers are not held by a thread that panicked").clone();
+-    let reach = reach::probe(probe, &dns);
++    let reach = reach::configured(probe, servers);
+     let _ = skyward_sys::kmsg(&format!("asking {server}: {e:#}; the network joined {reach}"));
+     match reach {
+         Reach::Online => Unanswered::Failed(format!("{e:#}")),
+diff --git a/crates/skyward/src/wlan.rs b/crates/skyward/src/wlan.rs
+index a6e13e5..630931a 100644
+--- a/crates/skyward/src/wlan.rs
++++ b/crates/skyward/src/wlan.rs
+@@ -13,7 +13,6 @@ use skyward_net::supplicant::{self, Bss, Control, Event as Told, Security};
+ use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
+ use skyward_sys::worker::{self, Teller};
+ use std::fs;
+-use std::net::Ipv4Addr;
+ use std::os::fd::RawFd;
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::{Path, PathBuf};
+@@ -65,6 +64,7 @@ pub enum Command {
+     Scan,
+     Join { ssid: Vec<u8>, name: String, security: Security, password: String },
+     Leave,
++    NetworkSettings,
+ }
+ 
+ /// What comes to the thread: a command, how asking for an address went,
+@@ -246,6 +246,13 @@ impl Station {
+ 
+     fn command(&mut self, c: Command) {
+         match c {
++            Command::NetworkSettings => {
++                write_resolver(&self.servers);
++                if let Some(Joined { stage: Stage::Connected(link), .. }) = &mut self.state.joined {
++                    link.reach = None;
++                    self.probe();
++                }
++            }
+             Command::On => self.on(),
+             Command::Off => self.off(),
+             Command::Scan => {
+@@ -483,7 +490,8 @@ impl Station {
+             "{} has {} ({}) through {:?} for {} s, kept again after {} s",
+             self.cfg.interface, lease.address, lease.mask, lease.router, lease.seconds, lease.renew
+         ));
+-        *self.servers.lock().expect("the DNS servers are not held by a thread that panicked") = lease.dns.clone();
++        self.servers.lock().expect("network settings lock").dhcp = lease.dns.clone();
++        write_resolver(&self.servers);
+         let mut link = Link::new(&lease, r.mac);
+         // An address kept keeps how far its network was found to reach; a
+         // new one has it looked at.
+@@ -491,30 +499,32 @@ impl Station {
+             Some(Joined { stage: Stage::Connected(had), .. }) if same => had.reach.clone(),
+             _ => None,
+         };
+-        let look = link.reach.is_none().then(|| lease.dns.clone());
++        let look = link.reach.is_none();
+         r.lease = Some(Held { lease, at: Instant::now(), phase: 0 });
+         if let Some(j) = &mut self.state.joined {
+             j.stage = Stage::Connected(link);
+         }
+-        if let Some(dns) = look {
+-            self.probe(dns);
++        if look {
++            self.probe();
+         }
+         self.poll_link();
+     }
+ 
+     /// Look how far the network joined reaches, on a thread of its own, the
+     /// page's name looked up in the network's own DNS servers, `dns`.
+-    fn probe(&mut self, dns: Vec<Ipv4Addr>) {
++    fn probe(&mut self) {
++        let network = self.servers.clone();
+         let (page, back) = (self.cfg.probe.clone(), self.back.clone());
+         let Some(r) = &mut self.running else { return };
+         r.probed += 1;
+         let n = r.probed;
+         thread::spawn(move || {
+-            let reach = reach::probe(&page, &dns);
++            let reach = reach::configured(&page, &network);
+             back.tell(Inbox::Reach(n, reach));
+         });
+     }
+ 
++
+     fn reached(&mut self, n: u64, reach: Reach) {
+         if self.running.as_ref().is_none_or(|r| r.probed != n) {
+             return;
+@@ -541,7 +551,8 @@ impl Station {
+         if r.counted.take().is_some() {
+             self.tell.tell(Report::Traffic(Traffic::default()));
+         }
+-        self.servers.lock().expect("the DNS servers are not held by a thread that panicked").clear();
++        self.servers.lock().expect("network settings lock").dhcp.clear();
++        write_resolver(&self.servers);
+     }
+ 
+     fn timers(&mut self) {
+@@ -722,3 +733,12 @@ fn end(child: &mut Child, control: Option<&Control>) {
+     let _ = child.kill();
+     let _ = child.wait();
+ }
++
++fn write_resolver(network: &Servers) {
++        let servers = network.lock().expect("network settings lock").dns_servers();
++        let text: String = servers.iter().map(|server| format!("nameserver {server}\n")).collect();
++        if let Err(why) = fs::write("/etc/resolv.conf", text) {
++            let _ = skyward_sys::kmsg(&format!("write DNS settings: {why}"));
++        }
++    }
++

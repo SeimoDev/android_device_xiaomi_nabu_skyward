@@ -28,3 +28,11 @@ The original recovery's Android runtime and TWRP components, AOSP VNDK 30,
 and the supplied ROM's hardware services provide the base environment.
 MiSans and Kirk Mono are supplied by the pinned Skyward source; their
 licenses are preserved by Skyward's packer.
+
+The optional browser runtime uses WPE WebKit 2.54.2 and its Debian ARM64
+library dependencies. browser/dependencies.json records the exact binary
+packages and their corresponding source locations. The runtime retains
+Debian copyright files under usr/share/doc. The browser bridge and launcher
+sources are in browser/src. The GLib 2.90.1 pidfd compatibility patch and
+build scripts are in browser/patches and browser/scripts; the complete
+release source archive also includes the original GLib source tarball.

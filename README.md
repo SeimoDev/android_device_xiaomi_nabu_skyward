@@ -23,6 +23,12 @@ Display, touch, root ADB, MTP session, Wi-Fi scanning, Wi-Fi connection and inte
 
 The ROM disables file and metadata encryption. Credential-based FBE decryption on other ROMs is unverified; SharedSecret negotiation on this vendor returns error `-38`. Other ROM versions require their own hardware validation. The image uses the recovery base's permissive SELinux and root ADB configuration.
 
+## Browser and advanced networking
+
+The home page includes a **Browser** entry below WLAN. Install the separate `skyward-browser-runtime.zip` component in Skyward to provide WPE WebKit, then open the browser from the home page. Its address bar, touch input, keyboard and navigation controls are integrated into the recovery. Downloads are saved in `/sdcard/Download/Skyward`; the Downloads button opens that folder.
+
+**WLAN → Advanced network settings** provides HTTP CONNECT / SOCKS5 proxy settings and automatic / manual DNS. The browser takes these settings when it starts. Browser sources, runtime build instructions and current limitations are in [browser/README.md](browser/README.md).
+
 ## Source layout
 
 This is a standalone Skyward device repository. Skyward uses a Rust workspace and TOML device configuration. The `patches/` directory contains all recovery changes relative to the pinned upstream commit.
@@ -32,8 +38,9 @@ nabu.toml                 Device and maintainer configuration
 upstream.json             Skyward commit and toolchain versions
 patches/                  Recovery platform and About-page changes
 recovery/root/            Recovery init and USB configuration
-helpers/                  Keymaster and servicemanager launchers
+helpers/                  Keymaster, servicemanager and browser launchers
 scripts/                  ROM extraction, dependency collection and image packing
+browser/                  WPE bridge, start page and optional runtime build
 proprietary-files.txt     ROM extraction inventory with SHA-256 digests
 materials.json            File provenance and destinations
 kernel/nabu.config        Configuration extracted from the ROM kernel

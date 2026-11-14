@@ -35,6 +35,8 @@ python3 "$device_dir/collect.py" --vendor "$rom_dir/vendor" \
     "$device_dir/keymaster-compat.c" -ldl -o "$device_dir/overlay/system/bin/skyward-keymaster-compat"
 "$clang" -Os -Wall -Wextra -Werror -fPIE -pie -Wl,--strip-all \
     "$device_dir/servicemanager.c" -o "$device_dir/overlay/system/bin/skyward-servicemanager"
+"$clang" -Os -Wall -Wextra -Werror -fPIE -pie -Wl,--strip-all \
+    "$device_dir/browser-runner.c" -o "$device_dir/overlay/system/bin/skyward-browser"
 python3 "$device_dir/prepare.py" --boot "$rom_dir/boot.img" --out "$output_dir/nabu"
 
 CARGO_TARGET_DIR="$host_target" cargo build --locked --release -p skyward-pack

@@ -1,0 +1,19 @@
+#!/system/bin/sh
+set -eu
+out=$2
+archive=$3
+message() { echo "ui_print $*" > /proc/self/fd/"$out"; echo ui_print > /proc/self/fd/"$out"; }
+[ -d /data/media/0 ] || { message '请先挂载 data / Mount data first'; exit 1; }
+[ -z "$(pidof browser 2>/dev/null || true)" ] || { message '请关闭浏览器后再安装 / Close the browser first'; exit 1; }
+base=/data/skyward/browser
+mkdir -p "$base"
+message '正在安装浏览器组件 / Installing browser runtime'
+unzip -p "$archive" runtime.tar.gz > "$base/runtime.tar.gz"
+mkdir -p "$base/root.new"
+tar -xzf "$base/runtime.tar.gz" -C "$base/root.new"
+chmod 755 "$base/root.new/opt/wpe/browser"
+[ ! -e "$base/root.old" ] || rm -rf "$base/root.old"
+[ ! -e "$base/root" ] || mv "$base/root" "$base/root.old"
+mv "$base/root.new" "$base/root"
+rm -f "$base/runtime.tar.gz"
+message '浏览器组件安装完成 / Browser runtime installed'

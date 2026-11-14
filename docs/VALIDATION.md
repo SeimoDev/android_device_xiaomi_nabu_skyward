@@ -14,3 +14,23 @@ The recovery base was tested on Xiaomi Pad 5 (nabu) running
 
 The bundled installer saved the original boot backup, wrote the current boot_a partition and verified its contents by reading it back on the tablet. Saved brightness and automatic unencrypted-data mounting were also confirmed after a fresh recovery start.
 Credential-based FBE decryption remains unverified because the tested ROM disables encryption.
+
+## v0.3.1-nabu.2
+
+The browser-enabled boot image was compiled and temporarily booted on the
+tablet. The home-page entry launched the WPE bridge and exported live webpage
+frames into Skyward. The preceding WPE prototype on the same recovery runtime
+loaded HTTPS pages, received native touch and keyboard events, and downloaded
+a file with its contents verified. This does not establish full website
+compatibility for the integrated browser UI.
+
+Advanced network work passed 47 skyward-net tests and 341 skyward-ui tests;
+the initial browser integration passed 343 skyward-ui tests. Android builds
+completed after the final browser viewport adjustment. The device repository's
+reconstructed source was compared with the files used for the published image.
+
+The browser runtime is a separate data-resident component. It uses software
+rendering; media and WebGL are disabled. Its mount namespace, chroot and
+unprivileged UID run with WebKit's bubblewrap sandbox disabled. Credential-based
+FBE decryption and this release's browser download UI have not been validated
+across other ROMs.
