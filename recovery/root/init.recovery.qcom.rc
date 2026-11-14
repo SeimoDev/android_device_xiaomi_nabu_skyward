@@ -1,0 +1,34 @@
+on early-init
+    write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
+
+on init
+    write /sys/class/backlight/panel0-backlight/brightness 200
+    # The kernel starts on performance and vendor_boot disables CPU idle.
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor schedutil
+    write /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor schedutil
+    write /sys/devices/system/cpu/cpu7/cpufreq/scaling_governor schedutil
+    write /sys/module/lpm_levels/parameters/sleep_disabled 0
+    mkdir /dev/fscklogs 0770 root system
+    chown root wakelock /sys/power/wake_lock
+    chown root wakelock /sys/power/wake_unlock
+    chmod 0660 /sys/power/wake_lock
+    chmod 0660 /sys/power/wake_unlock
+
+on fs
+    wait /dev/block/platform/soc/${ro.boot.bootdevice}
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+
+on boot
+    mkdir /data/vendor 0771 root root
+    mkdir /data/vendor/wifi 0770 wifi wifi
+    mkdir /data/vendor/wifi/sockets 0770 wifi wifi
+    mkdir /data/vendor/wlan_logs 0770 system wifi
+    mkdir /data/vendor/mac_addr 0770 system wifi
+    mkdir /data/vendor/tombstones 0771 system system
+    mkdir /data/vendor/tombstones/rfs 0771 system system
+    mkdir /data/vendor/tombstones/rfs/modem 0770 oem_2903 system
+    mkdir /data/vendor/tombstones/rfs/lpass 0770 oem_2903 system
+    mkdir /data/vendor/tombstones/rfs/slpi 0770 oem_2903 system
+    mkdir /data/vendor/tombstones/rfs/cdsp 0770 oem_2903 system
+    mkdir /data/vendor/tombstones/rfs/tn 0770 oem_2903 system
+    setprop sys.usb.config adb

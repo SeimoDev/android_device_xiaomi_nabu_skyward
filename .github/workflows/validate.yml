@@ -1,0 +1,26 @@
+name: Validate device sources
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y lz4
+      - name: Check extraction scripts
+        run: |
+          python3 -m compileall -q bootstrap.py scripts
+          cd scripts
+          python3 -m unittest test_prepare
+      - name: Prepare pinned Skyward sources
+        run: python3 bootstrap.py
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Validate recovery code
+        working-directory: work/skyward
+        run: cargo test --locked -p skyward-bootimg -p skyward-install -p skyward-config -p skyward-info -p skyward-ui

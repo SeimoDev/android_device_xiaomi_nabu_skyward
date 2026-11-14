@@ -1,0 +1,412 @@
+{
+  "files": [
+    {
+      "source": "vendor/firmware/a630_gmu.bin",
+      "destination": "system/etc/firmware/a630_gmu.bin",
+      "size": 32768,
+      "sha256": "b07f90299ff2ae33948fcfd6ed67f53fbd287b5bf85ff2d43db11d4d32c1621f"
+    },
+    {
+      "source": "vendor/firmware/a630_sqe.fw",
+      "destination": "system/etc/firmware/a630_sqe.fw",
+      "size": 32136,
+      "sha256": "36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c"
+    },
+    {
+      "source": "vendor/firmware/a640_gmu.bin",
+      "destination": "system/etc/firmware/a640_gmu.bin",
+      "size": 37680,
+      "sha256": "3ff0c02708bbe78641db887fa62f3a7f9337934d0c2ce0b961ef7c43172591d2"
+    },
+    {
+      "source": "vendor/firmware/a640_zap.b00",
+      "destination": "system/etc/firmware/a640_zap.b00",
+      "size": 148,
+      "sha256": "c9e39868fb6edcc30fc3574657f10dd1dfe22c9cd79e53de213a69703582091f"
+    },
+    {
+      "source": "vendor/firmware/a640_zap.b01",
+      "destination": "system/etc/firmware/a640_zap.b01",
+      "size": 6712,
+      "sha256": "b2688af4607c73f88f85d49dbb3333f6b3912d31ebc327cda570ed9e0dafb24a"
+    },
+    {
+      "source": "vendor/firmware/a640_zap.b02",
+      "destination": "system/etc/firmware/a640_zap.b02",
+      "size": 1968,
+      "sha256": "e24a4f483b71ea19715910f01e1abf94280756df731cad05df48fd7714e34198"
+    },
+    {
+      "source": "vendor/firmware/a640_zap.elf",
+      "destination": "system/etc/firmware/a640_zap.elf",
+      "size": 14256,
+      "sha256": "14d07e71aaeb9f6bf4639038fe9941524893a34014f67c2b0f0f85fec631b76d"
+    },
+    {
+      "source": "vendor/firmware/a640_zap.mdt",
+      "destination": "system/etc/firmware/a640_zap.mdt",
+      "size": 6860,
+      "sha256": "5c5a956febabc8c8f3fc7b2cc48ae22bcab9ae25a9853c7cd0baadc9ec406882"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.b00",
+      "destination": "system/etc/firmware/ipa_fws.b00",
+      "size": 212,
+      "sha256": "f8e8e7ad72fca66e001419a9f31a11e70acf7c5543c33564fc7ab398c9dd724d"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.b01",
+      "destination": "system/etc/firmware/ipa_fws.b01",
+      "size": 6808,
+      "sha256": "9676f4952579af4288df946158f088c824d9877ffcbab09c5d1ef21b59da4cbb"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.b02",
+      "destination": "system/etc/firmware/ipa_fws.b02",
+      "size": 22096,
+      "sha256": "2e181083e6c54c2387090ea3ad0dd758e1f97f839a08bc550927693d933f016d"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.b03",
+      "destination": "system/etc/firmware/ipa_fws.b03",
+      "size": 128,
+      "sha256": "14024088f436ebd24b097cb113b2177e12c939efdac0211d560c7cc498611507"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.b04",
+      "destination": "system/etc/firmware/ipa_fws.b04",
+      "size": 320,
+      "sha256": "8d572c4b4dee9572d90ab90137ec030331856bbfd8bf2e6ee315da4a5bab3373"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.elf",
+      "destination": "system/etc/firmware/ipa_fws.elf",
+      "size": 41280,
+      "sha256": "21980908a4ed336d9b2cbf45c8e82c485cafcc5977f89a5b955a5de846358b9c"
+    },
+    {
+      "source": "vendor/firmware/ipa_fws.mdt",
+      "destination": "system/etc/firmware/ipa_fws.mdt",
+      "size": 7020,
+      "sha256": "8c184520ed6eed57b7beb776efbe82fdfdb157d67f2c67b6283ee8ab5cee76f7"
+    },
+    {
+      "source": "vendor/firmware/ipa_uc.b00",
+      "destination": "system/etc/firmware/ipa_uc.b00",
+      "size": 148,
+      "sha256": "95487d9b623219d571492291b909b5c4b33f722f707e51fed3098c98b732c744"
+    },
+    {
+      "source": "vendor/firmware/ipa_uc.b01",
+      "destination": "system/etc/firmware/ipa_uc.b01",
+      "size": 6712,
+      "sha256": "55de4b2dac49ed026841d444b4f9ed7c318f701bdbe133e338f0b42001b0a6b6"
+    },
+    {
+      "source": "vendor/firmware/ipa_uc.b02",
+      "destination": "system/etc/firmware/ipa_uc.b02",
+      "size": 37972,
+      "sha256": "cbf00d084b3a2d5f90188f1303ebdca9ea3de21b16e524bdabfd4ac4d28d7eaa"
+    },
+    {
+      "source": "vendor/firmware/ipa_uc.elf",
+      "destination": "system/etc/firmware/ipa_uc.elf",
+      "size": 50260,
+      "sha256": "24a72ca5a374aaefd6db06633740a766b4fb59fbc83681a00db888742ab52f05"
+    },
+    {
+      "source": "vendor/firmware/ipa_uc.mdt",
+      "destination": "system/etc/firmware/ipa_uc.mdt",
+      "size": 6860,
+      "sha256": "f1e5a8373e778751a55a1593fed64e2d0f0dedeb6813c299a10f38329e4e8150"
+    },
+    {
+      "source": "vendor/etc/wifi/WCNSS_qcom_cfg.ini",
+      "destination": "system/etc/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini",
+      "size": 16920,
+      "sha256": "aa132665230107d3bbecb6f2d2a3e9a11e372bde5846e6d1becefd4dadd1c670"
+    },
+    {
+      "source": "vendor/lib64/libqmi_cci.so",
+      "destination": "system/lib64/libqmi_cci.so",
+      "size": 50080,
+      "sha256": "9778faa45745912a59e3c9dbe369f1b48eeea8247b91fe94970eab140e4fb872"
+    },
+    {
+      "source": "vendor/lib64/libqmiservices.so",
+      "destination": "system/lib64/libqmiservices.so",
+      "size": 153040,
+      "sha256": "a0c3cf7bc83333973124c52883f713b4a17a2de9dafc4c27091b3b7b81661639"
+    },
+    {
+      "source": "vendor/lib64/libidl.so",
+      "destination": "system/lib64/libidl.so",
+      "size": 19368,
+      "sha256": "79fc8f3ebc0c42afce0ac3e95bdd561d2e23671fc401a9b36b067fb02276f32b"
+    },
+    {
+      "source": "vendor/lib64/libmdmdetect.so",
+      "destination": "system/lib64/libmdmdetect.so",
+      "size": 19944,
+      "sha256": "cd3cfb13e665441f1db87c17bba49b149a8ee422c7898c7124544eae2b45193c"
+    },
+    {
+      "source": "vendor/lib64/libkeystore-wifi-hidl.so",
+      "destination": "system/lib64/libkeystore-wifi-hidl.so",
+      "size": 15920,
+      "sha256": "62edc18becaae49cee74fa0a421f03fa67578984bc4cfc3fd3380f0aaedc2e4c"
+    },
+    {
+      "source": "vendor/lib64/libkeystore-engine-wifi-hidl.so",
+      "destination": "system/lib64/libkeystore-engine-wifi-hidl.so",
+      "size": 20712,
+      "sha256": "0505e681f7890883d064a7647ecfaa340dd54f929aeec9d3bbb320bc67816b75"
+    },
+    {
+      "source": "vendor/lib64/libcert_parse.wpa_s.so",
+      "destination": "system/lib64/libcert_parse.wpa_s.so",
+      "size": 205520,
+      "sha256": "86015948dc06900f76c587b8a63ece2021f077dcdc53460fdebf369aadb55770"
+    },
+    {
+      "source": "vndk30/root/lib64/android.hardware.wifi.supplicant@1.0.so",
+      "destination": "system/lib64/android.hardware.wifi.supplicant@1.0.so",
+      "size": 1306368,
+      "sha256": "15b29def338a6ea89934034f3f7af4c7b3c497b9f9ed0698911c80461769c8f6"
+    },
+    {
+      "source": "vndk30/root/lib64/android.hardware.wifi.supplicant@1.1.so",
+      "destination": "system/lib64/android.hardware.wifi.supplicant@1.1.so",
+      "size": 479824,
+      "sha256": "816ac33f5e4d3b2c7e2ee37e9036710011193a7b3ba90cfaac2c1401c407ffdd"
+    },
+    {
+      "source": "vndk30/root/lib64/android.hardware.wifi.supplicant@1.2.so",
+      "destination": "system/lib64/android.hardware.wifi.supplicant@1.2.so",
+      "size": 716168,
+      "sha256": "562d90f7a03ac019a8a37da4d7aeccbeb46ae8e825b650fc65bdf5c0c1d7bbc3"
+    },
+    {
+      "source": "vndk30/root/lib64/android.hardware.wifi.supplicant@1.3.so",
+      "destination": "system/lib64/android.hardware.wifi.supplicant@1.3.so",
+      "size": 658192,
+      "sha256": "5fbd5c1b1bb6851e4d3cd6255ad06a413f41bfa9d4f310f3390dbdaeea01a67c"
+    },
+    {
+      "source": "vendor/lib64/vendor.qti.hardware.wifi.supplicant@2.0.so",
+      "destination": "system/lib64/vendor.qti.hardware.wifi.supplicant@2.0.so",
+      "size": 592328,
+      "sha256": "a0a50cae5ad52b7b67d23dd60fcb3592c526422fc46874ef5101227c61d8b353"
+    },
+    {
+      "source": "vendor/lib64/vendor.qti.hardware.wifi.supplicant@2.1.so",
+      "destination": "system/lib64/vendor.qti.hardware.wifi.supplicant@2.1.so",
+      "size": 165568,
+      "sha256": "d3c38db871f6e87167521d940a29f93c2b9a2a57fb03c506378055a31255134c"
+    },
+    {
+      "source": "vendor/lib64/vendor.qti.hardware.wifi.supplicant@2.2.so",
+      "destination": "system/lib64/vendor.qti.hardware.wifi.supplicant@2.2.so",
+      "size": 179496,
+      "sha256": "9acc490dcd6ce995d2a136d19dfbff1231b4439a0d7bca9b47239bacba4339f0"
+    },
+    {
+      "source": "vendor/lib64/libqmi_common_so.so",
+      "destination": "system/lib64/libqmi_common_so.so",
+      "size": 11304,
+      "sha256": "b2e2e34acf5e865ed987150f2145adcff55a786c5d59a9971872cbf14ef85984"
+    },
+    {
+      "source": "vendor/lib64/libcld80211.so",
+      "destination": "system/lib64/libcld80211.so",
+      "size": 19688,
+      "sha256": "f6dd6df81dda66d2e773377f0b67887078b8e35495c0b1f01e4eebc927f9b309"
+    },
+    {
+      "source": "vendor/lib64/libperipheral_client.so",
+      "destination": "system/lib64/libperipheral_client.so",
+      "size": 55648,
+      "sha256": "f50c1efd52d5164af74eab9290da1bc018592b618363d80af518e20b36185063"
+    },
+    {
+      "source": "vendor/lib64/libqrtr.so",
+      "destination": "system/lib64/libqrtr.so",
+      "size": 11416,
+      "sha256": "ff6fd39b6ca2f8524f2bb4daa7fc0ba2e454da44c88930f149531e14cefa422f"
+    },
+    {
+      "source": "vendor/lib64/libjson.so",
+      "destination": "system/lib64/libjson.so",
+      "size": 45712,
+      "sha256": "715cc28efaede1b769270c1af6fa717240f99e537274b9de43e5eb4bb585bd3a"
+    },
+    {
+      "source": "vendor/lib64/libqmi_encdec.so",
+      "destination": "system/lib64/libqmi_encdec.so",
+      "size": 19440,
+      "sha256": "962a793081f9d61160608e8073df82fb23f9a1d71e51480fdd0787721826fccb"
+    },
+    {
+      "source": "vendor/lib64/libqmi_csi.so",
+      "destination": "system/lib64/libqmi_csi.so",
+      "size": 37536,
+      "sha256": "3ea6bbf7b06bfe2bc2a9f55340df914d831836ac802f365f5215258719f7891c"
+    },
+    {
+      "source": "vendor/lib64/libqsocket.so",
+      "destination": "system/lib64/libqsocket.so",
+      "size": 10872,
+      "sha256": "d7f6889872381349c943a21a366c50e7c030aa1cd992414101b140a0bbcd356d"
+    },
+    {
+      "source": "vendor/lib64/libQSEEComAPI.so",
+      "destination": "system/lib64/libQSEEComAPI.so",
+      "size": 40816,
+      "sha256": "eaf3e45fc0771561ebf68032d5c090c613efff0219073165773aaa3776cf5557"
+    },
+    {
+      "source": "vendor/lib64/libdrmfs.so",
+      "destination": "system/lib64/libdrmfs.so",
+      "size": 41080,
+      "sha256": "2acb28f7ac2274f2d27a1a167bb0acc02e8267bcb88d109e8c0cfff265efc32f"
+    },
+    {
+      "source": "vendor/lib64/libqcbor.so",
+      "destination": "system/lib64/libqcbor.so",
+      "size": 19504,
+      "sha256": "e31d27b0a022f19681f3f817b0e3ad8567c0fd28c235515115c89e593a4a2685"
+    },
+    {
+      "source": "vendor/lib64/libminksocket.so",
+      "destination": "system/lib64/libminksocket.so",
+      "size": 36872,
+      "sha256": "39c7bbfd9ff445588b129b80b970ed7b4bd61483bd6be36b28f23bc4cd28f4d7"
+    },
+    {
+      "source": "vendor/lib64/libminkdescriptor.so",
+      "destination": "system/lib64/libminkdescriptor.so",
+      "size": 33544,
+      "sha256": "f3811cf0589ec0bd5760d556d85de122137045f1114edfbc82f27211befeef93"
+    },
+    {
+      "source": "vndk30/root/lib64/libcurl.so",
+      "destination": "system/lib64/libcurl.so",
+      "size": 360016,
+      "sha256": "c4bab24d0aacfb919f872bdbd5fbd5198c191139f733a14ea96bf359bc9de093"
+    },
+    {
+      "source": "vendor/lib64/libqmi.so",
+      "destination": "system/lib64/libqmi.so",
+      "size": 286792,
+      "sha256": "209150cf0d0930c3a6721c68a06759bea0aaed3852b1ae4e2d1f36bfa668a661"
+    },
+    {
+      "source": "vendor/lib64/libdsi_netctrl.so",
+      "destination": "system/lib64/libdsi_netctrl.so",
+      "size": 606024,
+      "sha256": "bd926f029981a5a0ee7877a11b54e1199e77a6c416629f3db9980a4be541fc23"
+    },
+    {
+      "source": "vendor/lib64/libqtikeymaster4.so",
+      "destination": "system/lib64/libqtikeymaster4.so",
+      "size": 151072,
+      "sha256": "36a19ae6ba9c046e0e06ea2573500d14fca4741883021c4343dbfaf4aa44eb84"
+    },
+    {
+      "source": "vendor/lib64/libboot_control_qti.so",
+      "destination": "system/lib64/libboot_control_qti.so",
+      "size": 117272,
+      "sha256": "bc0f8bf66034babd70331fbc0704a9e363ec9e86af47a81196db144f12c2948e"
+    },
+    {
+      "source": "vendor/lib64/vendor.qti.hardware.wifi.keystore@1.0.so",
+      "destination": "system/lib64/vendor.qti.hardware.wifi.keystore@1.0.so",
+      "size": 76872,
+      "sha256": "b41c0a47186ce6faa1ce6cea6f02f8c76f1bf83834760750745998a660884b3b"
+    },
+    {
+      "source": "vndk30/root/lib64/android.hardware.wifi@1.0.so",
+      "destination": "system/lib64/android.hardware.wifi@1.0.so",
+      "size": 1034464,
+      "sha256": "664ceb7fbce365d3a62716b32d9efc718f5087b7215c7d45020fb945519a70f2"
+    },
+    {
+      "source": "vendor/lib64/libdiag.so",
+      "destination": "system/lib64/libdiag.so",
+      "size": 220208,
+      "sha256": "8c4dd2a054cddd9765c734540c27d1e2d95d48ab2d9ce8d17c5769f21fb409e0"
+    },
+    {
+      "source": "vendor/lib64/libqmi_client_qmux.so",
+      "destination": "system/lib64/libqmi_client_qmux.so",
+      "size": 47472,
+      "sha256": "8af7f033efa23f3f7a956e6ade60e6f245baead108a48811339cddb14812e411"
+    },
+    {
+      "source": "vendor/lib64/libdsutils.so",
+      "destination": "system/lib64/libdsutils.so",
+      "size": 103320,
+      "sha256": "9e49e5255961abd2f2632fc80f33529f0f3ec303c4084131c628e8dede8cf755"
+    },
+    {
+      "source": "vendor/lib64/libqdi.so",
+      "destination": "system/lib64/libqdi.so",
+      "size": 161112,
+      "sha256": "ea827107ea8dc1f9cc8cecf062a7a522243494484c5ffbfad81029be060cefe8"
+    },
+    {
+      "source": "vendor/lib64/libnetmgr.so",
+      "destination": "system/lib64/libnetmgr.so",
+      "size": 172200,
+      "sha256": "5c8bb82393566cc76ca6266ac870a12f12c060dcfe2e4f148559633f51c4c112"
+    },
+    {
+      "source": "vendor/lib64/libconfigdb.so",
+      "destination": "system/lib64/libconfigdb.so",
+      "size": 33360,
+      "sha256": "1a15cff83ea1a7fda6bed910d7824f45e2ffeeec86a216ea968054acba49b045"
+    },
+    {
+      "source": "vendor/lib64/libqmi_client_helper.so",
+      "destination": "system/lib64/libqmi_client_helper.so",
+      "size": 21984,
+      "sha256": "12dcb9ccdc57e79451668df88418a422b9214e30f753a73585521c455ac4e21e"
+    },
+    {
+      "source": "vendor/lib64/libkeymasterdeviceutils.so",
+      "destination": "system/lib64/libkeymasterdeviceutils.so",
+      "size": 19832,
+      "sha256": "62d46e3f7bb36744909dd65bc5c2fbaeb729189eecbe6071df782f6ec37462d9"
+    },
+    {
+      "source": "vendor/lib64/libkeymasterutils.so",
+      "destination": "system/lib64/libkeymasterutils.so",
+      "size": 38952,
+      "sha256": "51421d010673151767b7579e7e6e55f67dee0c96f463c2c1ed74b92349895d94"
+    },
+    {
+      "source": "vendor/lib64/librecovery_updater.so",
+      "destination": "system/lib64/librecovery_updater.so",
+      "size": 83736,
+      "sha256": "54b266bee25c9df7b0cdb6598fef315f22d55f105d3b3d6c3613ffb3b8c8cc42"
+    },
+    {
+      "source": "vndk30/root/lib64/libnetutils.so",
+      "destination": "system/lib64/libnetutils.so",
+      "size": 32808,
+      "sha256": "cf46dded8da50425865a49bc3d09b41df1727bfb8677eb3e6b3d3a4fad3e3bb0"
+    },
+    {
+      "source": "vendor/lib64/libxml.so",
+      "destination": "system/lib64/libxml.so",
+      "size": 38216,
+      "sha256": "c5f4b5c9a747d0732846a9ea4d8db2d9a954189369a9ad885c8bd7e3c3653b46"
+    },
+    {
+      "source": "vendor/lib64/libspcom.so",
+      "destination": "system/lib64/libspcom.so",
+      "size": 53360,
+      "sha256": "eefa2a384e20aea40b362fdeb1cbbdc932d0bb22658a4661a3b6a0dfd4fcb5d0"
+    }
+  ]
+}

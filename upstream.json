@@ -1,0 +1,8 @@
+{
+  "url": "https://github.com/kirklin/skyward.git",
+  "commit": "c5e09f6eb644e75e051b309f98d6745ccbc97d81",
+  "version": "0.3.1",
+  "rust": "1.100.0",
+  "ndk": "r29",
+  "android_api": 30
+}

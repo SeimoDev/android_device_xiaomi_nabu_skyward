@@ -1,0 +1,6 @@
+on init
+    setprop sys.usb.controller a600000.dwc3
+    setprop sys.usb.config_disable 0
+
+on property:ro.boot.usbcontroller=*
+    setprop sys.usb.controller ${ro.boot.usbcontroller}

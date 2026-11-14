@@ -1,0 +1,30 @@
+Xiaomi Pad 5 (nabu) adaptation for Skyward Recovery
+Device maintainer: Seimo
+https://github.com/SeimoDev
+https://x.com/SeimoDev
+
+Skyward Recovery is developed by kirklin and contributors:
+https://github.com/kirklin/skyward
+The adaptation and Skyward patches are distributed under GPL-3.0,
+as provided in LICENSE. Upstream copyright and license notices remain
+in the corresponding source files.
+
+The build extracts the existing recovery ramdisk, kernel, firmware and
+Android/Qualcomm libraries from:
+HyperOS_4.0.0.41_nabu_A17_by_zxcwsurx_20260920.zip
+These components retain their respective original licenses.
+The extraction inventory is recorded in proprietary-files.txt and
+materials.json. The ROM must be supplied to rebuild an image.
+
+The kernel is reused from the ROM boot image:
+4.14.180-moon-os3-ga5805c039, built 2026-04-03.
+The matching Moon kernel binary distribution is mirrored at:
+https://github.com/sticpaper/moon_kernel_mirror/tree/main/nabu/20260403
+kernel/nabu.config records the embedded build configuration.
+The mirror contains distributed kernel binaries; it is not presented
+as the kernel's corresponding source tree.
+
+The original recovery's Android runtime and TWRP components, AOSP VNDK 30,
+and the supplied ROM's hardware services provide the base environment.
+MiSans and Kirk Mono are supplied by the pinned Skyward source; their
+licenses are preserved by Skyward's packer.

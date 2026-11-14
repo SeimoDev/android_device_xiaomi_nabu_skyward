@@ -1,0 +1,2150 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ee5530e..b948a6f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2437,8 +2437,10 @@ dependencies = [
+  "abootimg-oxide",
+  "anyhow",
+  "cpio",
++ "flate2",
+  "libc",
+  "lz4_flex 0.14.0",
++ "sha2 0.10.9",
+  "tempfile",
+ ]
+ 
+@@ -2597,6 +2599,7 @@ dependencies = [
+  "skyward-programs",
+  "tempfile",
+  "unpayload",
++ "zip 8.6.0",
+ ]
+ 
+ [[package]]
+diff --git a/crates/skyward-binder/src/parcel.rs b/crates/skyward-binder/src/parcel.rs
+index 0e6e510..5530906 100644
+--- a/crates/skyward-binder/src/parcel.rs
++++ b/crates/skyward-binder/src/parcel.rs
+@@ -5,6 +5,25 @@ use anyhow::{bail, Context, Result};
+ /// the recovery's own programs are built from is the recovery copy.
+ const HEADER: i32 = i32::from_be_bytes(*b"RECO");
+ 
++fn header() -> i32 {
++    #[cfg(target_os = "android")]
++    {
++        static VALUE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
++        *VALUE.get_or_init(|| header_for(skyward_sys::prop("ro.skyward.binder.header").as_deref()))
++    }
++    #[cfg(not(target_os = "android"))]
++    HEADER
++}
++
++#[cfg(any(target_os = "android", test))]
++fn header_for(value: Option<&str>) -> i32 {
++    // Some recovery bases use the system variant of libbinder.
++    match value {
++        Some("SYST") => i32::from_be_bytes(*b"SYST"),
++        _ => HEADER,
++    }
++}
++
+ /// Strict mode gathers violations rather than acting on them; a caller with
+ /// no policy of its own still sets that bit.
+ const STRICT_MODE_PENALTY_GATHER: i32 = i32::MIN;
+@@ -76,7 +95,7 @@ impl Parcel {
+         let mut p = Parcel::default();
+         p.i32(STRICT_MODE_PENALTY_GATHER);
+         p.i32(UNSET_WORK_SOURCE);
+-        p.i32(HEADER);
++        p.i32(header());
+         p.string(interface);
+         p
+     }
+@@ -306,6 +325,13 @@ impl<'a> Reader<'a> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn the_base_can_select_its_system_libbinder_header() {
++        assert_eq!(header_for(Some("SYST")), i32::from_be_bytes(*b"SYST"));
++        assert_eq!(header_for(None), HEADER);
++        assert_eq!(header_for(Some("RECO")), HEADER);
++    }
++
+     #[test]
+     fn a_call_opens_with_the_header_and_the_interface_name() {
+         let p = Parcel::call("a.b.IC");
+diff --git a/crates/skyward-block/src/loopdev.rs b/crates/skyward-block/src/loopdev.rs
+index ab782de..dc45d45 100644
+--- a/crates/skyward-block/src/loopdev.rs
++++ b/crates/skyward-block/src/loopdev.rs
+@@ -15,6 +15,9 @@ mod android {
+ 
+     const GET_FREE: u32 = 0x4C82;
+     const CONFIGURE: u32 = 0x4C0A;
++    const SET_FD: u32 = 0x4C00;
++    const CLR_FD: u32 = 0x4C01;
++    const SET_STATUS64: u32 = 0x4C04;
+ 
+     /// The device only ever reads. It stays pointed at the file until the
+     /// recovery ends, which is as long as anything mounted from it lasts.
+@@ -48,8 +51,7 @@ mod android {
+     }
+ 
+     /// Open `file` from `offset` for `length` bytes as a block device, and
+-    /// give its path. The device goes away once whatever is mounted from it
+-    /// is unmounted.
++    /// give its path. It remains attached until recovery ends.
+     pub fn attach(file: &Path, offset: u64, length: u64) -> Result<PathBuf> {
+         let backing = File::open(file).with_context(|| format!("open {}", file.display()))?;
+         let control = File::open(CONTROL).with_context(|| format!("open {CONTROL}"))?;
+@@ -69,7 +71,22 @@ mod android {
+         config.info.size_limit = length;
+         config.info.flags = READ_ONLY;
+         if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
+-            return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
++            let error = std::io::Error::last_os_error();
++            // LOOP_CONFIGURE was added in Linux 5.8. Older Android kernels
++            // return EINVAL (or ENOTTY) for that unknown request.
++            if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) {
++                return Err(error).with_context(|| format!("point {} at {}", path.display(), file.display()));
++            }
++            // The read-only backing fd also keeps the old two-step path
++            // read-only before its offset and size limit have been set.
++            if unsafe { libc::ioctl(device.as_raw_fd(), SET_FD as libc::Ioctl, backing.as_raw_fd()) } < 0 {
++                return Err(std::io::Error::last_os_error()).context("attach backing file to loop device");
++            }
++            if unsafe { libc::ioctl(device.as_raw_fd(), SET_STATUS64 as libc::Ioctl, &config.info) } < 0 {
++                let error = std::io::Error::last_os_error();
++                unsafe { libc::ioctl(device.as_raw_fd(), CLR_FD as libc::Ioctl) };
++                return Err(error).context("set loop device offset and size limit");
++            }
+         }
+         Ok(path)
+     }
+diff --git a/crates/skyward-bootimg/Cargo.toml b/crates/skyward-bootimg/Cargo.toml
+index c34a04d..87e915f 100644
+--- a/crates/skyward-bootimg/Cargo.toml
++++ b/crates/skyward-bootimg/Cargo.toml
+@@ -8,8 +8,11 @@ license.workspace = true
+ abootimg-oxide = "0.5.2"
+ anyhow = { workspace = true }
+ cpio = "0.4.1"
++flate2 = "1.1"
+ libc = { workspace = true }
+ lz4_flex = "0.14.0"
+ 
++sha2 = "0.10.9"
++
+ [dev-dependencies]
+ tempfile = "3.27.0"
+diff --git a/crates/skyward-pack/src/avb.rs b/crates/skyward-bootimg/src/avb.rs
+similarity index 100%
+rename from crates/skyward-pack/src/avb.rs
+rename to crates/skyward-bootimg/src/avb.rs
+diff --git a/crates/skyward-bootimg/src/lib.rs b/crates/skyward-bootimg/src/lib.rs
+index b35dff4..d3df166 100644
+--- a/crates/skyward-bootimg/src/lib.rs
++++ b/crates/skyward-bootimg/src/lib.rs
+@@ -2,6 +2,7 @@
+ //! their ramdisks are: read, changed and written again, by the image packer
+ //! on a computer and by the recovery on the phone.
+ 
++pub mod avb;
+ mod image;
+ mod ramdisk;
+ 
+diff --git a/crates/skyward-bootimg/src/ramdisk.rs b/crates/skyward-bootimg/src/ramdisk.rs
+index a266fa3..b00b35c 100644
+--- a/crates/skyward-bootimg/src/ramdisk.rs
++++ b/crates/skyward-bootimg/src/ramdisk.rs
+@@ -49,11 +49,14 @@ pub struct Ramdisk {
+ }
+ 
+ impl Ramdisk {
+-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
+-    /// boot images carry.
++    /// Unpack a gzip or LZ4 compressed newc archive.
+     pub fn decode(compressed: &[u8]) -> Result<Self> {
+         let mut cpio = Vec::new();
+-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
++        if compressed.starts_with(&[0x1f, 0x8b]) {
++            flate2::read::MultiGzDecoder::new(compressed).read_to_end(&mut cpio).context("gzip decode")?;
++        } else {
++            lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
++        }
+         let mut entries = Vec::new();
+         let mut rest = Cursor::new(cpio.as_slice());
+         loop {
+@@ -87,6 +90,18 @@ impl Ramdisk {
+         lz4_tool(&self.archive()?)
+     }
+ 
++    /// Keep the base image's compression: older kernels can have RD_GZIP
++    /// enabled while RD_LZ4 is disabled.
++    pub fn encode_like(&self, original: &[u8]) -> Result<Vec<u8>> {
++        if original.starts_with(&[0x1f, 0x8b]) {
++            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
++            encoder.write_all(&self.archive()?)?;
++            Ok(encoder.finish()?)
++        } else {
++            self.encode()
++        }
++    }
++
+     /// Pack as a newc archive, uncompressed.
+     pub fn archive(&self) -> Result<Vec<u8>> {
+         let mut cpio = Vec::new();
+@@ -297,6 +312,22 @@ fn lz4_tool(input: &[u8]) -> Result<Vec<u8>> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn gzip_ramdisks_keep_their_compression_and_metadata() {
++        let mut rd = Ramdisk { entries: Vec::new() };
++        rd.add("system/bin/recovery", 0o750, b"recovery".to_vec()).unwrap();
++        rd.link("init", "system/bin/init").unwrap();
++        rd.entries.last_mut().unwrap().uid = 1000;
++        let packed = rd.encode_like(&[0x1f, 0x8b]).unwrap();
++        assert_eq!(&packed[..2], &[0x1f, 0x8b]);
++        let back = Ramdisk::decode(&packed).unwrap();
++        assert_eq!(back.find("system/bin/recovery").unwrap().data, b"recovery");
++        let link = back.find("init").unwrap();
++        assert_eq!((link.mode & S_IFMT, link.uid), (S_IFLNK, 1000));
++        assert_eq!(link.data, b"system/bin/init");
++        assert!(Ramdisk::decode(&packed[..packed.len() - 5]).is_err());
++    }
++
+     #[test]
+     fn round_trip_keeps_metadata() {
+         let mut rd = Ramdisk { entries: Vec::new() };
+diff --git a/crates/skyward-pack/tests/avb-footer-1000.bin b/crates/skyward-bootimg/tests/avb-footer-1000.bin
+similarity index 100%
+rename from crates/skyward-pack/tests/avb-footer-1000.bin
+rename to crates/skyward-bootimg/tests/avb-footer-1000.bin
+diff --git a/crates/skyward-pack/tests/avb-footer-4096.bin b/crates/skyward-bootimg/tests/avb-footer-4096.bin
+similarity index 100%
+rename from crates/skyward-pack/tests/avb-footer-4096.bin
+rename to crates/skyward-bootimg/tests/avb-footer-4096.bin
+diff --git a/crates/skyward-config/src/lib.rs b/crates/skyward-config/src/lib.rs
+index 873967f..00d2ab6 100644
+--- a/crates/skyward-config/src/lib.rs
++++ b/crates/skyward-config/src/lib.rs
+@@ -7,6 +7,7 @@ use std::path::Path;
+ /// (they sit under `/` once the kernel unpacks the ramdisk).
+ pub mod ramdisk {
+     /// The device configuration, copied from `devices/<codename>.toml`.
++    pub const BOOT_INSTALLER: &str = "system/etc/skyward/boot-installer.zip";
+     pub const CONFIG: &str = "skyward/device.toml";
+     /// The UI typeface.
+     pub const FONT: &str = "skyward/MiSansVF.ttf";
+@@ -125,6 +126,7 @@ pub struct Wlan {
+     /// The service it registers with the service directory as it starts,
+     /// which the directory takes only from a program the running system
+     /// describes.
++    #[serde(default)]
+     pub service: String,
+     /// The page the stock system asks over plain HTTP to tell whether a
+     /// network reaches the internet, which answers 204 with nothing.
+@@ -256,10 +258,22 @@ pub struct Names {
+     pub en: String,
+ }
+ 
++/// The person maintaining this device port, shown with their public links.
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
++pub struct Maintainer {
++    pub name: String,
++    pub github: String,
++    pub x: String,
++}
++
+ #[derive(Debug, Clone, Deserialize)]
+ pub struct Device {
+     pub codename: String,
+     #[serde(default)]
++    pub maintainer: Option<Maintainer>,
++    #[serde(default)]
++    pub recovery_in_boot: bool,
++    #[serde(default)]
+     pub brand: String,
+     #[serde(default)]
+     pub model: String,
+diff --git a/crates/skyward-crypto/src/compat.rs b/crates/skyward-crypto/src/compat.rs
+new file mode 100644
+index 0000000..53166af
+--- /dev/null
++++ b/crates/skyward-crypto/src/compat.rs
+@@ -0,0 +1,47 @@
++//! Android's compatibility service wraps a hardware Keymaster 4.x as
++//! KeyMint v1 and SharedSecret. The secure world still performs every key
++//! operation; this only selects the binder interface used to reach it.
++
++#![cfg_attr(not(target_os = "android"), allow(dead_code))]
++
++use skyward_binder::parcel::Parcel;
++
++pub const SERVICE: &str = "android.security.compat";
++const INTERFACE: &str = "android.security.compat.IKeystoreCompatService";
++const TRUSTED_ENVIRONMENT: i32 = 1;
++pub const KEYMINT: u32 = 1;
++pub const SHARED_SECRET: u32 = 3;
++
++fn request() -> Parcel {
++    let mut call = Parcel::call(INTERFACE);
++    call.i32(TRUSTED_ENVIRONMENT);
++    call
++}
++
++#[cfg(target_os = "android")]
++pub fn device(binder: &skyward_binder::driver::Binder, code: u32) -> anyhow::Result<skyward_binder::driver::Handle<'_>> {
++    use anyhow::Context;
++    use skyward_binder::{driver::Handle, service, status};
++    let compat = service::find(binder, SERVICE)?.context("the Keymaster compatibility service is not running")?;
++    let reply = compat.transact(code, &request()).context("request the hardware Keymaster wrapper")?;
++    let mut read = reply.read();
++    status::ok(&mut read).context("request the hardware Keymaster wrapper")?;
++    let handle = read.object()?.context("the Keymaster compatibility service returned no hardware device")?;
++    Handle::hold(binder, handle)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use skyward_binder::parcel::Reader;
++
++    #[test]
++    fn requests_the_hardware_trusted_environment() {
++        let call = request();
++        let mut read = Reader::new(call.bytes());
++        assert_eq!(read.call().unwrap(), INTERFACE);
++        assert_eq!(read.i32().unwrap(), 1);
++        assert_eq!(read.here(), call.bytes().len());
++        assert_eq!((KEYMINT, SHARED_SECRET), (1, 3));
++    }
++}
+diff --git a/crates/skyward-crypto/src/data.rs b/crates/skyward-crypto/src/data.rs
+index 53903a5..d3615b2 100644
+--- a/crates/skyward-crypto/src/data.rs
++++ b/crates/skyward-crypto/src/data.rs
+@@ -84,10 +84,11 @@ fn open(service: &KeyMint) -> Result<Opened> {
+     })();
+     match mounted {
+         Ok((checked, filesystem)) => Ok(Opened { mapped, filesystem, checked }),
+-        Err(e) => match dm::remove(MAPPED) {
++        Err(e) if dm::status(MAPPED)?.is_some() => match dm::remove(MAPPED) {
+             Ok(()) => Err(e),
+             Err(r) => Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}"))),
+         },
++        Err(e) => Err(e),
+     }
+ }
+ 
+@@ -97,8 +98,11 @@ fn open(service: &KeyMint) -> Result<Opened> {
+ fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
+     let entries = skyward_block::fstab::read(MOUNT)?;
+     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
+-    let encryption = Encryption::of(entry)?;
+     let device = skyward_block::fstab::device(entry)?;
++    if entry.extra("metadata_encryption").is_none() {
++        return Ok((entries, device.into()));
++    }
++    let encryption = Encryption::of(entry)?;
+     let key = storage_key(service, entry, &encryption)?;
+     let sectors = skyward_block::size_bytes(&device)? / 512;
+     let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], false)?;
+@@ -109,13 +113,16 @@ fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
+ /// filesystem to be repaired, and give the device it is reached through;
+ /// [`unmap`] takes it away again. The partition is to be closed.
+ pub fn map_unmounted(service: &KeyMint) -> Result<PathBuf> {
+-    anyhow::ensure!(dm::status(MAPPED)?.is_none(), "the data partition is open");
++    anyhow::ensure!(dm::status(MAPPED)?.is_none() && !mount::is_mount_point(Path::new(MOUNT))?, "the data partition is open");
+     map(service).map(|(_, mapped)| mapped)
+ }
+ 
+ /// Take away the mapping [`map_unmounted`] made.
+ pub fn unmap() -> Result<()> {
+-    dm::remove(MAPPED)
++    if dm::status(MAPPED)?.is_some() {
++        dm::remove(MAPPED)?;
++    }
++    Ok(())
+ }
+ 
+ /// Show the owner's shared storage at /sdcard; shown already, it stays.
+@@ -172,6 +179,19 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
+         true => None,
+         false => Some(open(service)?),
+     };
++    // Ports may disable both metadata encryption and fscrypt. Confirm the
++    // installed table and the actual directories before exposing storage.
++    if !Path::new(FILE_MODE).exists()
++        && skyward_block::fstab::read(MOUNT)?.iter().all(|e| e.extra("fileencryption").is_none())
++    {
++        for dir in [PathBuf::from("/data/system"), Path::new(SHARED_STORAGE).join(OWNER.to_string())] {
++            if dir.exists() {
++                anyhow::ensure!(crate::fscrypt::unlocked(&dir)?, "{} is encrypted but its fscrypt configuration is missing", dir.display());
++            }
++        }
++        show_owner_storage()?;
++        return Ok(Opening { mounted, closed: Vec::new() });
++    }
+     open_shared(service)?;
+     let mut closed = Vec::new();
+     let mut owner = Note::default();
+diff --git a/crates/skyward-crypto/src/keymint.rs b/crates/skyward-crypto/src/keymint.rs
+index 95d6d7f..c2de6b2 100644
+--- a/crates/skyward-crypto/src/keymint.rs
++++ b/crates/skyward-crypto/src/keymint.rs
+@@ -128,8 +128,10 @@ pub struct KeyMint<'a> {
+ impl<'a> KeyMint<'a> {
+     /// Reach the running key service, or say that none is.
+     pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
+-        let device = service::find(binder, SERVICE)?
+-            .with_context(|| format!("{SERVICE} is not running; the phone's key service has to be started first"))?;
++        let device = match service::find(binder, SERVICE)? {
++            Some(device) => device,
++            None => crate::compat::device(binder, crate::compat::KEYMINT)?,
++        };
+         Ok(KeyMint { device })
+     }
+ 
+diff --git a/crates/skyward-crypto/src/lib.rs b/crates/skyward-crypto/src/lib.rs
+index 9a6b46f..23c6ba2 100644
+--- a/crates/skyward-crypto/src/lib.rs
++++ b/crates/skyward-crypto/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub mod encryption;
++pub mod compat;
+ pub mod fscrypt;
+ pub mod gatekeeper;
+ pub mod keystore;
+diff --git a/crates/skyward-crypto/src/sharedsecret.rs b/crates/skyward-crypto/src/sharedsecret.rs
+index 51e6672..818a9b7 100644
+--- a/crates/skyward-crypto/src/sharedsecret.rs
++++ b/crates/skyward-crypto/src/sharedsecret.rs
+@@ -77,8 +77,12 @@ pub struct SharedSecret<'a> {
+ impl<'a> SharedSecret<'a> {
+     /// Reach the part registered under `name`, or say that none is.
+     pub fn open(binder: &'a skyward_binder::driver::Binder, name: &str) -> Result<SharedSecret<'a>> {
+-        let device = skyward_binder::service::find(binder, name)?
+-            .with_context(|| format!("{name} is not running; the phone's key service has to be started first"))?;
++        let device = if name == crate::compat::SERVICE {
++            crate::compat::device(binder, crate::compat::SHARED_SECRET)?
++        } else {
++            skyward_binder::service::find(binder, name)?
++                .with_context(|| format!("{name} is not running; the phone's key service has to be started first"))?
++        };
+         Ok(SharedSecret { device })
+     }
+ 
+diff --git a/crates/skyward-info/src/lib.rs b/crates/skyward-info/src/lib.rs
+index 6f5dc71..6d96f9a 100644
+--- a/crates/skyward-info/src/lib.rs
++++ b/crates/skyward-info/src/lib.rs
+@@ -29,6 +29,7 @@ const SYS_BLOCK: &str = "/sys/class/block";
+ pub struct DeviceInfo {
+     pub model: String,
+     pub codename: String,
++    pub maintainer: Option<skyward_config::Maintainer>,
+     pub soc: Option<skyward_config::Names>,
+     pub cpu: Cpu,
+     /// `MemTotal` in KiB.
+@@ -158,6 +159,7 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
+         // system whose partitions are not mounted.
+         model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+         codename: cfg.device.codename.clone(),
++        maintainer: cfg.device.maintainer.clone(),
+         soc: cfg.device.soc.clone(),
+         cpu: cpu(Path::new(CPU))?,
+         ram_kib: mem_total(&read("/proc/meminfo")?)?,
+diff --git a/crates/skyward-install/Cargo.toml b/crates/skyward-install/Cargo.toml
+index 437d7dd..e2257e8 100644
+--- a/crates/skyward-install/Cargo.toml
++++ b/crates/skyward-install/Cargo.toml
+@@ -17,6 +17,7 @@ polyfuse-kernel = "0.2.0"
+ rsa = "0.9.10"
+ sha1 = { version = "0.10.7", features = ["oid"] }
+ sha2 = { version = "0.10.9", features = ["oid"] }
++skyward-bootimg = { path = "../skyward-bootimg" }
+ skyward-block = { path = "../skyward-block" }
+ skyward-config = { path = "../skyward-config" }
+ skyward-info = { path = "../skyward-info" }
+@@ -29,5 +30,4 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
+ zstd = { version = "0.14.3", default-features = false }
+ 
+ [dev-dependencies]
+-skyward-bootimg = { path = "../skyward-bootimg" }
+ tempfile = "3.27.0"
+diff --git a/crates/skyward-install/src/boot.rs b/crates/skyward-install/src/boot.rs
+new file mode 100644
+index 0000000..02616d6
+--- /dev/null
++++ b/crates/skyward-install/src/boot.rs
+@@ -0,0 +1,194 @@
++//! Installing recovery into a boot slot while retaining its kernel and
++//! normal Android boot path. Every write follows a persistent boot backup.
++use anyhow::{ensure, Context, Result};
++use sha2::{Digest, Sha256};
++use skyward_bootimg::{avb, BootImage, Ramdisk};
++use skyward_config::{ramdisk, DeviceConfig};
++use std::fs::{self, OpenOptions};
++use std::io::{Cursor, Read, Write};
++use std::path::{Path, PathBuf};
++
++pub const BACKUPS: &str = "/data/media/0/Skyward/boot-backups";
++
++/// Rebuild a slot's boot from its own header and kernel and the packaged
++/// recovery ramdisk. The package is retained so installation can run again.
++pub fn prepare(stock: &[u8], package: &[u8], capacity: usize, codename: &str) -> Result<Vec<u8>> {
++    prepare_from_root(stock, package, capacity, codename, Path::new("/"))
++}
++
++/// Reconstruct large immutable ramdisk files from the matching running
++/// recovery, checking every size and digest before preparing an image.
++pub fn prepare_from_root(stock: &[u8], package: &[u8], capacity: usize, codename: &str, root: &Path) -> Result<Vec<u8>> {
++    ensure!(capacity == stock.len(), "boot image size differs from partition capacity");
++    let mut image = BootImage::parse(stock)?;
++    ensure!(!image.kernel.is_empty(), "the boot image has no kernel");
++    let mut zip = zip::ZipArchive::new(Cursor::new(package)).context("read the boot installer package")?;
++    let mut payload = Vec::new();
++    zip.by_name("ramdisk.cpio.gz")?.read_to_end(&mut payload)?;
++    let mut expected = Vec::new();
++    zip.by_name("kernel.sha256")?.read_to_end(&mut expected)?;
++    ensure!(Sha256::digest(&image.kernel)[..] == expected, "the installed kernel differs from this device build's supported kernel");
++    let mut rd = Ramdisk::decode(&payload)?;
++    let mut files = String::new();
++    zip.by_name("ramdisk.files")?.read_to_string(&mut files)?;
++    for line in files.lines() {
++        let fields: Vec<&str> = line.split('\t').collect();
++        ensure!(fields.len() == 3, "invalid boot installer file inventory");
++        let (name, size, expected) = (fields[0], fields[1].parse::<usize>()?, fields[2]);
++        ensure!((name.starts_with("system/") || name.starts_with("skyward/")) && Path::new(name).components().all(|p| matches!(p, std::path::Component::Normal(_))), "invalid boot installer file path");
++        let entry = rd.entries.iter_mut().find(|e| e.name == name).context("installer file is absent from the ramdisk")?;
++        ensure!(entry.mode & 0o170000 == 0o100000 && entry.data.is_empty(), "installer file is not an empty regular file");
++        let data = fs::read(root.join(name)).with_context(|| format!("read recovery file {name}"))?;
++        let sum: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
++        ensure!(data.len() == size && sum == expected, "{name} differs from the matching recovery build; boot has not been written");
++        entry.data = data;
++    }
++    let config = rd.find(ramdisk::CONFIG).context("the recovery ramdisk has no device configuration")?;
++    let cfg = DeviceConfig::parse(std::str::from_utf8(&config.data)?)?;
++    ensure!(cfg.device.codename == codename && cfg.device.recovery_in_boot, "the installer package does not support this device's boot layout");
++    ensure!(rd.find(ramdisk::BOOT_INSTALLER).is_none(), "the installer payload contains a nested installer");
++    rd.add(ramdisk::BOOT_INSTALLER, 0o644, package.to_vec())?;
++    image.ramdisk = rd.encode_like(&payload)?;
++    // The temporary fastboot image forces recovery. Installed boot follows
++    // the bootloader's normal/recovery choice through the base's init.
++    let commandline = std::str::from_utf8(&image.header.cmdline[..])?.trim_end_matches('\0');
++    let commandline = commandline.split_whitespace().filter(|word| {
++        !matches!(word.split('=').next(), Some("twrpfastboot" | "androidboot.fastboot"))
++    }).collect::<Vec<_>>().join(" ");
++    image.header.cmdline.fill(0);
++    image.header.cmdline[..commandline.len()].copy_from_slice(commandline.as_bytes());
++    let bytes = image.to_bytes()?;
++    avb::footed(&bytes, "boot", capacity, &Sha256::digest(&bytes))
++}
++
++/// Save the entire partition before any flash. An existing matching
++/// backup is reused only after its complete contents have been verified.
++pub fn backup(original: &[u8], directory: &Path, name: &str) -> Result<PathBuf> {
++    ensure!(matches!(name, "boot_a" | "boot_b"), "unexpected boot partition name");
++    fs::create_dir_all(directory)?;
++    let digest = Sha256::digest(original);
++    let sum: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
++    let path = directory.join(format!("{name}-{sum}.img"));
++    match OpenOptions::new().write(true).create_new(true).open(&path) {
++        Ok(mut file) => {
++            file.write_all(original)?;
++            file.sync_all()?;
++            std::fs::File::open(directory)?.sync_all()?;
++        }
++        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
++        Err(e) => return Err(e).context("create the original boot backup"),
++    }
++    ensure!(fs::read(&path)? == original, "the original boot backup failed verification");
++    Ok(path)
++}
++
++#[cfg(target_os = "android")]
++pub fn install_running(package: &Path) -> Result<()> {
++    let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
++    ensure!(cfg.device.codename == "nabu" && cfg.device.recovery_in_boot, "this build does not support boot installation");
++    ensure!(skyward_block::boot_param("androidboot.verifiedbootstate")?.as_deref() == Some("orange"), "boot installation requires an unlocked bootloader");
++    ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "finish the pending system update before installing to boot");
++    ensure!(skyward_block::mount::is_mount_point(Path::new("/data"))? && Path::new("/data/media/0").is_dir(), "open internal storage before installing to boot");
++    let slot = skyward_vab::current_slot()?.context("the current boot slot is unknown")?;
++    let name = format!("boot{}", slot.suffix());
++    let device = crate::image::device(Path::new(skyward_block::BY_NAME), "boot", slot);
++    let capacity = usize::try_from(skyward_block::size_bytes(&device)?)?;
++    ensure!(capacity == 134217728, "unexpected nabu boot partition size");
++    let original = fs::read(&device)?;
++    println!("Preparing {name}; preserving the installed kernel");
++    let image = prepare(&original, &fs::read(package)?, capacity, &cfg.device.codename)?;
++    let saved = backup(&original, Path::new(BACKUPS), &name)?;
++    println!("Original boot backup: {}", saved.display());
++    ensure!(fs::read(&device)? == original, "boot changed while the installer was preparing");
++    println!("Writing and verifying {name}");
++    crate::image::flash(&mut Cursor::new(&image), image.len() as u64, &[device], &mut |_, _| {})?;
++    println!("Skyward is installed in {name}. Reboot to system or recovery.");
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn sample(codename: &str) -> (Vec<u8>, Vec<u8>) {
++        let mut rd = Ramdisk::decode(&crate::image::samples::lz4_legacy(&crate::image::samples::archive(&[]))).unwrap();
++        rd.add(ramdisk::CONFIG, 0o644, format!("[device]\ncodename = \"{codename}\"\nrecovery_in_boot = true\n").into_bytes()).unwrap();
++        let payload = rd.encode_like(&[0x1f, 0x8b]).unwrap();
++        let mut image = BootImage::parse(&crate::image::samples::boot_image(64, &payload)).unwrap();
++        let args = b"console=ttyMSM0 twrpfastboot=1 androidboot.fastboot=1 androidboot.hardware=qcom";
++        image.header.cmdline[..args.len()].copy_from_slice(args);
++        let mut stock = image.to_bytes().unwrap();
++        stock.resize(65536, 0);
++        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
++        let options = zip::write::SimpleFileOptions::default();
++        for (name, data) in [("ramdisk.cpio.gz", payload), ("ramdisk.files", Vec::new()), ("kernel.sha256", Sha256::digest(&image.kernel).to_vec())] {
++            zip.start_file(name, options).unwrap();
++            zip.write_all(&data).unwrap();
++        }
++        (stock, zip.finish().unwrap().into_inner())
++    }
++
++    #[test]
++    fn boot_preparation_keeps_the_kernel_and_normal_boot_path_and_rebuilds_avb() {
++        let (stock, package) = sample("nabu");
++        let result = prepare(&stock, &package, stock.len(), "nabu").unwrap();
++        let before = BootImage::parse(&stock).unwrap();
++        let after = BootImage::parse(&result).unwrap();
++        assert_eq!(after.kernel, before.kernel);
++        let cmdline = std::str::from_utf8(&after.header.cmdline[..]).unwrap().trim_end_matches('\0');
++        assert_eq!(cmdline, "console=ttyMSM0 androidboot.hardware=qcom");
++        let rd = Ramdisk::decode(&after.ramdisk).unwrap();
++        assert_eq!(rd.find(ramdisk::BOOT_INSTALLER).unwrap().data, package);
++        assert_eq!(result.len(), stock.len());
++        assert_eq!(&result[result.len()-64..result.len()-60], b"AVBf");
++        let footer = &result[result.len()-64..];
++        let vbmeta = u64::from_be_bytes(footer[20..28].try_into().unwrap()) as usize;
++        assert!(result[vbmeta..].windows(4).any(|w| w == b"boot"));
++    }
++
++    #[test]
++    fn mismatched_device_kernel_or_capacity_is_refused_before_writing() {
++        let (mut stock, package) = sample("nabu");
++        assert!(prepare(&stock, &package, stock.len(), "ishtar").is_err());
++        assert!(prepare(&stock, &package, stock.len()-4096, "nabu").is_err());
++        stock[4096] ^= 1;
++        assert!(prepare(&stock, &package, stock.len(), "nabu").is_err());
++    }
++
++    #[test]
++    fn runtime_files_are_restored_only_when_their_digests_match() {
++        let (stock, package) = sample("nabu");
++        let mut old = zip::ZipArchive::new(Cursor::new(&package)).unwrap();
++        let mut payload = Vec::new();
++        old.by_name("ramdisk.cpio.gz").unwrap().read_to_end(&mut payload).unwrap();
++        let mut rd = Ramdisk::decode(&payload).unwrap();
++        rd.add("system/bin/runtime-file", 0o755, Vec::new()).unwrap();
++        let data = vec![7; 65536];
++        let sum: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
++        let files = format!("system/bin/runtime-file\t65536\t{sum}\n");
++        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
++        for (name, value) in [("ramdisk.cpio.gz", rd.encode_like(&payload).unwrap()), ("ramdisk.files", files.into_bytes()), ("kernel.sha256", Sha256::digest(&BootImage::parse(&stock).unwrap().kernel).to_vec())] {
++            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
++            zip.write_all(&value).unwrap();
++        }
++        let package = zip.finish().unwrap().into_inner();
++        let root = tempfile::tempdir().unwrap();
++        let dir = root.path().join("system/bin");
++        fs::create_dir_all(&dir).unwrap();
++        fs::write(dir.join("runtime-file"), data).unwrap();
++        let image = prepare_from_root(&stock, &package, stock.len(), "nabu", root.path()).unwrap();
++        let rd = Ramdisk::decode(&BootImage::parse(&image).unwrap().ramdisk).unwrap();
++        assert_eq!(rd.find("system/bin/runtime-file").unwrap().data.len(), 65536);
++        fs::write(dir.join("runtime-file"), vec![8;65536]).unwrap();
++        assert!(prepare_from_root(&stock, &package, stock.len(), "nabu", root.path()).is_err());
++    }
++
++    #[test]
++    fn backup_keeps_the_original_and_rejects_a_damaged_previous_copy() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = backup(b"original boot", dir.path(), "boot_a").unwrap();
++        assert_eq!(backup(b"original boot", dir.path(), "boot_a").unwrap(), path);
++        fs::write(&path, b"truncated").unwrap();
++        assert!(backup(b"original boot", dir.path(), "boot_a").is_err());
++        assert!(backup(b"original boot", dir.path(), "../boot").is_err());
++    }
++}
+diff --git a/crates/skyward-install/src/lib.rs b/crates/skyward-install/src/lib.rs
+index 213f214..76eec16 100644
+--- a/crates/skyward-install/src/lib.rs
++++ b/crates/skyward-install/src/lib.rs
+@@ -6,6 +6,7 @@
+ pub mod adb;
+ pub mod asked;
+ pub mod blockmap;
++pub mod boot;
+ pub mod commands;
+ pub mod fuse;
+ pub mod image;
+diff --git a/crates/skyward-pack/Cargo.toml b/crates/skyward-pack/Cargo.toml
+index cc4f55a..c0e1781 100644
+--- a/crates/skyward-pack/Cargo.toml
++++ b/crates/skyward-pack/Cargo.toml
+@@ -27,5 +27,7 @@ tempfile = "3.27.0"
+ # partitions where they lie in it.
+ unpayload = { version = "0.1.2", default-features = false, features = ["http"] }
+ 
++zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
++
+ [dev-dependencies]
+ serde_json = "1.0.145"
+diff --git a/crates/skyward-pack/src/boot_installer.rs b/crates/skyward-pack/src/boot_installer.rs
+new file mode 100644
+index 0000000..67b90b8
+--- /dev/null
++++ b/crates/skyward-pack/src/boot_installer.rs
+@@ -0,0 +1,42 @@
++use anyhow::Result;
++use skyward_bootimg::Ramdisk;
++use sha2::{Digest, Sha256};
++use std::io::{Cursor, Write};
++
++const SCRIPT: &str = r#"#!/system/bin/sh
++OUTFD="$2"
++ui_print() { echo "ui_print $*" >&$OUTFD; echo "ui_print" >&$OUTFD; }
++ui_print "Install Skyward to the current boot slot"
++ui_print "The original boot image is backed up before writing."
++ln -sf /system/bin/recovery /tmp/skyward-install-cli || exit 1
++/tmp/skyward-install-cli install-boot --package "$3" >/tmp/skyward-boot-install.log 2>&1
++result=$?
++while IFS= read -r line; do ui_print "$line"; done </tmp/skyward-boot-install.log
++exit "$result"
++"#;
++
++pub fn package(ramdisk: &[u8], kernel: &[u8]) -> Result<Vec<u8>> {
++    let mut rd = Ramdisk::decode(ramdisk)?;
++    let mut files = String::new();
++    for entry in &mut rd.entries {
++        if entry.mode & 0o170000 == 0o100000 && entry.data.len() >= 65536 && (entry.name.starts_with("system/") || entry.name.starts_with("skyward/")) {
++            let sum: String = Sha256::digest(&entry.data).iter().map(|b| format!("{b:02x}")).collect();
++            files.push_str(&format!("{}\t{}\t{sum}\n", entry.name, entry.data.len()));
++            entry.data.clear();
++        }
++    }
++    let payload = rd.encode_like(ramdisk)?;
++    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
++    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)
++        .last_modified_time(zip::DateTime::default());
++    for (name, mode, data) in [
++        ("META-INF/com/google/android/update-binary", 0o755, SCRIPT.as_bytes()),
++        ("ramdisk.cpio.gz", 0o644, payload.as_slice()),
++        ("ramdisk.files", 0o644, files.as_bytes()),
++        ("kernel.sha256", 0o644, &Sha256::digest(kernel)[..]),
++    ] {
++        zip.start_file(name, options.unix_permissions(mode))?;
++        zip.write_all(data)?;
++    }
++    Ok(zip.finish()?.into_inner())
++}
+diff --git a/crates/skyward-pack/src/main.rs b/crates/skyward-pack/src/main.rs
+index a4b9a90..9cccd8b 100644
+--- a/crates/skyward-pack/src/main.rs
++++ b/crates/skyward-pack/src/main.rs
+@@ -6,7 +6,8 @@ use std::fs::File;
+ use std::io::{Read, Seek, SeekFrom, Write};
+ use std::path::{Path, PathBuf};
+ 
+-mod avb;
++use skyward_bootimg::avb;
++mod boot_installer;
+ mod described;
+ 
+ use skyward_bootimg::{BootImage, Ramdisk};
+@@ -44,10 +45,17 @@ enum Cmd {
+     /// service becomes Skyward. The image fills the whole partition and ends
+     /// in an unsigned AVB footer of its own.
+     Recovery {
+-        /// The device's stock recovery image: the whole partition, as the
+-        /// phone or a full update package holds it, ending in its AVB footer.
+-        #[arg(long)]
++        /// A stock or prepared recovery base. Images without an AVB footer
++        /// require an explicit partition size.
++        #[arg(long = "base", alias = "stock")]
+         stock: PathBuf,
++        /// Known partition capacity in bytes, for a prepared base without
++        /// an AVB footer. The rebuilt image must fit including its footer.
++        #[arg(long)]
++        partition_size: Option<usize>,
++        /// Partition named in the AVB descriptor (boot for recovery-as-boot).
++        #[arg(long, default_value = "recovery", value_parser = ["recovery", "boot"])]
++        partition_name: String,
+         /// Skyward built for the device (aarch64-linux-android).
+         #[arg(long)]
+         binary: PathBuf,
+@@ -117,7 +125,7 @@ fn main() -> Result<()> {
+         }
+         Cmd::Repack { image, out } => {
+             let mut img = BootImage::read(&image)?;
+-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
++            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode_like(&img.ramdisk)?;
+             write(&out, &img, &img.to_bytes()?)
+         }
+         Cmd::Boot { kernel, ramdisk, out } => {
+@@ -125,8 +133,14 @@ fn main() -> Result<()> {
+             img.kernel = BootImage::read(&kernel)?.kernel;
+             write(&out, &img, &img.to_bytes()?)
+         }
+-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+-            let size = partition_size(&stock)?;
++        Cmd::Recovery { stock, partition_size: capacity, partition_name, binary, system_init, config, font, mono, mono_license, out } => {
++            let size = match capacity {
++                Some(size) => {
++                    ensure!(size >= 65536 && size % 4096 == 0, "partition size must be at least 65536 bytes and page aligned");
++                    size
++                }
++                None => partition_size(&stock)?,
++            };
+             let mut img = BootImage::read(&stock)?;
+             let mut rd = Ramdisk::decode(&img.ramdisk)?;
+             // A stock recovery ramdisk has no third-party tree; refuse to build
+@@ -135,7 +149,7 @@ fn main() -> Result<()> {
+                 anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+             }
+             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
+-            skyward_config::DeviceConfig::load(&config)?;
++            let cfg = skyward_config::DeviceConfig::load(&config)?;
+             rd.replace(paths::RECOVERY, read(&binary)?)?;
+             // Install scripts look for the commands a stock recovery lacks
+             // among its programs, and its unzip there too, a link to ziptool
+@@ -168,9 +182,14 @@ fn main() -> Result<()> {
+             let mut props = without(stock_props, &BUILD_VERSION);
+             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+             rd.replace(paths::PROP_DEFAULT, props)?;
+-            img.ramdisk = rd.encode()?;
++            if cfg.device.recovery_in_boot {
++                let payload = rd.encode_like(&img.ramdisk)?;
++                let package = boot_installer::package(&payload, &img.kernel)?;
++                rd.add(paths::BOOT_INSTALLER, 0o644, package)?;
++            }
++            img.ramdisk = rd.encode_like(&img.ramdisk)?;
+             let bytes = img.to_bytes()?;
+-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
++            write(&out, &img, &avb::footed(&bytes, &partition_name, size, &Sha256::digest(&bytes))?)
+         }
+         Cmd::Stock { config, out } => {
+             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
+diff --git a/crates/skyward-preview/src/main.rs b/crates/skyward-preview/src/main.rs
+index d47b9f7..d7acc07 100644
+--- a/crates/skyward-preview/src/main.rs
++++ b/crates/skyward-preview/src/main.rs
+@@ -143,7 +143,10 @@ fn main() -> Result<()> {
+         eprintln!("axis {tag}: {min}..{max} (default {def})");
+     }
+ 
+-    let cfg = DeviceConfig::load(root.join("devices/nezha.toml"))?;
++    let config = args.iter().position(|a| a == "--config")
++        .map(|k| args.get(k + 1).map(PathBuf::from).ok_or_else(|| anyhow!("--config needs a path")))
++        .transpose()?.unwrap_or_else(|| root.join("devices/nezha.toml"));
++    let cfg = DeviceConfig::load(config)?;
+     let (w, h) = (cfg.display.width, cfg.display.height);
+     let ppd = cfg.display.density as f32 / 160.0;
+     let light = Theme::light(w, h, ppd);
+@@ -163,6 +166,21 @@ fn main() -> Result<()> {
+     }
+ 
+     let info = nezha(&cfg);
++    if args.iter().any(|a| a == "--about-only" || a == "--install-only") {
++        for dark in [false, true] {
++            let screen = if args.iter().any(|a| a == "--install-only") { Screen::Install } else { Screen::About };
++            let mut app = opened(screen, w, h, ppd);
++            app.state.boot_install_available = cfg.device.recovery_in_boot;
++            app.state.dark = dark;
++            app.frame(&fonts, &info);
++            app.tick(0);
++            app.tick(2000);
++            let mut canvas = Canvas::new(w, h);
++            app.compose(&mut canvas, &fonts, &info, CLOCK, 2000);
++            write_png(&out.join(format!("{}-{}.png", if screen == Screen::About { "about" } else { "install" }, if dark { "dark" } else { "light" })), &canvas)?;
++        }
++        return Ok(());
++    }
+     let pending = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info.clone() };
+     let pattern = Data::Locked { user: 0, keys: Keys::Pattern, checking: false };
+     // Whole pages, the way a long screenshot shows them. The About page's
+@@ -1534,8 +1552,9 @@ fn whole_page(app: &mut App, f: &Fonts, info: &DeviceInfo) -> Canvas {
+ /// config supplies the SoC name, panel and screen size).
+ fn nezha(cfg: &DeviceConfig) -> DeviceInfo {
+     DeviceInfo {
+-        model: "Xiaomi 17 Ultra by Leica".into(),
++        model: cfg.device.model.clone(),
+         codename: cfg.device.codename.clone(),
++        maintainer: cfg.device.maintainer.clone(),
+         soc: cfg.device.soc.clone(),
+         cpu: Cpu { cores: 8, max_khz: Some(4_608_000) },
+         ram_kib: 15_472_464,
+diff --git a/crates/skyward-programs/src/phone.rs b/crates/skyward-programs/src/phone.rs
+index ad4a541..414872d 100644
+--- a/crates/skyward-programs/src/phone.rs
++++ b/crates/skyward-programs/src/phone.rs
+@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
+ /// in the order init reads them: the one the installed system keeps its
+ /// directory for hardware services of the older kind on, and the phone's
+ /// own.
+-pub const PARTITIONS: [&str; 3] = ["system_ext", "vendor", "odm"];
++pub const PARTITIONS: [&str; 4] = ["system", "system_ext", "vendor", "odm"];
+ 
+ /// The script of the phone's hardware, which the system's own first script
+ /// has init read; the scripts of the phone's partitions hang off it.
+@@ -69,7 +69,13 @@ pub struct Partition {
+ impl Partition {
+     /// A partition read where it is mounted.
+     pub fn mounted(name: &str, mounted: impl Into<PathBuf>) -> Partition {
+-        let mounted = mounted.into();
++        let mut mounted = mounted.into();
++        // System-as-root images keep the Android system directory one
++        // level below their filesystem root. Root-level bin/etc links
++        // would otherwise lead back into the recovery's own system.
++        if name == "system" && mounted.join("system/etc/init").is_dir() {
++            mounted = mounted.join("system");
++        }
+         Partition { name: name.into(), at: mounted.clone(), mounted }
+     }
+ }
+@@ -430,7 +436,7 @@ mod tests {
+         assert_eq!(on("/vendor/odm/bin/init.mi.factory_id.sh"), Some(("odm", "bin/init.mi.factory_id.sh")), "the vendor partition links to it");
+         assert_eq!(on("/system/vendor/odm/etc"), Some(("odm", "etc")));
+         assert_eq!(on("/vendor"), Some(("vendor", "")));
+-        assert_eq!(on("/system/bin/sh"), None, "the installed system's own partition is not read");
++        assert_eq!(on("/system/bin/sh"), Some(("system", "bin/sh")));
+         assert_eq!(on("/vendor_dlkm/lib/modules"), None, "a longer name is another partition");
+         assert_eq!(on("vendor/bin/sh"), None, "a path from nowhere is on none");
+     }
+diff --git a/crates/skyward-programs/src/secure.rs b/crates/skyward-programs/src/secure.rs
+index 33d73a5..b16c14f 100644
+--- a/crates/skyward-programs/src/secure.rs
++++ b/crates/skyward-programs/src/secure.rs
+@@ -13,6 +13,8 @@ use std::path::Path;
+ /// The key service, and the packages whose services it serves besides: it
+ /// is one program behind them all.
+ const KEYS: &str = "android.hardware.security.keymint.IKeyMintDevice/default";
++/// Recovery helper hosting Android's Keymaster 4.x compatibility library.
++pub const KEYMASTER_COMPAT: &str = "/system/bin/skyward-keymaster-compat";
+ const KEY_PACKAGES: [&str; 3] = ["android.hardware.security.keymint", "android.hardware.security.secureclock", "android.hardware.security.sharedsecret"];
+ 
+ /// The credential service and the boot control, each by its package and
+@@ -161,20 +163,33 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
+         }
+     }
+ 
+-    ensure!(described(phone, Kind::Aidl, KEYS).is_some(), "the phone describes no {KEYS}");
+-    let keys = behind(phone, "the key service", KEYS, |file| file.contains("keymint") && !file.contains("strongbox"))?;
+-    let with_keys = |d: &Described| d.instance == INSTANCE && KEY_PACKAGES.contains(&d.package.as_str());
+-    start(&mut out, started(phone, keys, Ready::Service(KEYS.into()), besides(phone, keys, KEYS, with_keys)));
++    let legacy_keys = described(phone, Kind::Aidl, KEYS).is_none();
++    if legacy_keys {
++        let (keys, kind) = offered(phone, ("android.hardware.keymaster", "IKeymasterDevice"))
++            .context("the phone describes neither KeyMint nor Keymaster")?;
++        ensure!(kind == Kind::Hidl && (keys.contains("@4.0::") || keys.contains("@4.1::")), "unsupported key service: {keys}");
++        start(&mut out, hardware_directory(phone)?);
++        let program = behind(phone, "the Keymaster service", &keys, |file| file.contains("keymaster"))?;
++        start(&mut out, started(phone, program, Ready::HardwareService(keys), Vec::new()));
++        // This service returns KeyMint and SharedSecret binder objects for
++        // the hardware Keymaster. It uses only the recovery's libraries.
++        let bridge = Service {
++            path: KEYMASTER_COMPAT.into(), args: Vec::new(), libraries: vec!["/system/lib64".into()],
++            oneshot: false, ready_property: Some("skyward.keymaster.compat.ready".into()),
++            ready_service: None, registers: Vec::new(), ready_hardware_service: None,
++            when: None, user: Some("root".into()), groups: vec!["root".into()], capabilities: Vec::new(),
++        };
++        start(&mut out, bridge.into());
++    } else {
++        let keys = behind(phone, "the key service", KEYS, |file| file.contains("keymint") && !file.contains("strongbox"))?;
++        let with_keys = |d: &Described| d.instance == INSTANCE && KEY_PACKAGES.contains(&d.package.as_str());
++        start(&mut out, started(phone, keys, Ready::Service(KEYS.into()), besides(phone, keys, KEYS, with_keys)));
++    }
+ 
+     let (credentials, credentials_kind) = offered(phone, CREDENTIALS).context("the phone describes no credential service")?;
+     let (boot, boot_kind) = offered(phone, BOOT).context("the phone describes no boot control")?;
+-    if credentials_kind == Kind::Hidl || boot_kind == Kind::Hidl {
+-        let directory = phone
+-            .programs
+-            .iter()
+-            .find(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p))
+-            .context("the phone has hardware services of the older kind, and no directory for them among the programs its scripts name")?;
+-        start(&mut out, started(phone, directory, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new()));
++    if !legacy_keys && (credentials_kind == Kind::Hidl || boot_kind == Kind::Hidl) {
++        start(&mut out, hardware_directory(phone)?);
+     }
+     let ready = |name: String, kind: Kind| match kind {
+         Kind::Aidl => Ready::Service(name),
+@@ -195,6 +210,13 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
+     Ok(out)
+ }
+ 
++fn hardware_directory(phone: &Phone) -> Result<Started> {
++    let directory = phone.programs.iter()
++        .find(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p))
++        .context("the phone has HIDL services but no hwservicemanager")?;
++    Ok(started(phone, directory, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new()))
++}
++
+ /// The description that tells of the service `name`, where it is the one
+ /// of `program` alone: a description named as the program's script is
+ /// tells of what that program registers and of nothing else. One named
+diff --git a/crates/skyward-programs/tests/nabu.rs b/crates/skyward-programs/tests/nabu.rs
+new file mode 100644
+index 0000000..ad9bddd
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu.rs
+@@ -0,0 +1,46 @@
++use skyward_programs::description::Kind;
++use skyward_programs::phone::{Partition, Phone, PARTITIONS};
++use skyward_programs::secure::{self, KEYMASTER_COMPAT};
++use std::collections::HashMap;
++use std::path::Path;
++
++#[test]
++fn nabu_hyperos4_uses_its_hardware_keymaster_and_hidl_supplicant() {
++    let root = std::env::var_os("SKYWARD_NABU_TEST_ROM").map(std::path::PathBuf::from)
++        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/nabu"));
++    let partitions = PARTITIONS.iter().map(|name| Partition {
++        name: name.to_string(),
++        mounted: match *name { "vendor" | "odm" => format!("/{name}"), "system" => "/mnt/system/system".into(), _ => format!("/mnt/{name}") }.into(),
++        at: if *name == "system" { root.join("system/system") } else { root.join(name) },
++    }).collect();
++    let phone = Phone::read(partitions, HashMap::new(), None).unwrap();
++    let steps = secure::steps(&phone).unwrap();
++    let programs = secure::programs(&steps);
++    let paths: Vec<_> = programs.iter().map(|p| p.service.path.as_str()).collect();
++    assert_eq!(paths, [
++        "/vendor/bin/qseecomd",
++        "/vendor/bin/ssgtzd",
++        "/mnt/system/system/bin/hwservicemanager",
++        "/vendor/bin/hw/android.hardware.keymaster@4.1-service-qti",
++        KEYMASTER_COMPAT,
++        "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
++        "/vendor/bin/hw/android.hardware.boot-service.nabu",
++    ]);
++    assert_eq!(programs[3].service.ready_hardware_service.as_deref(), Some("android.hardware.keymaster@4.1::IKeymasterDevice/default"));
++    assert_eq!(programs[4].service.ready_property.as_deref(), Some("skyward.keymaster.compat.ready"));
++    assert_eq!(programs[5].service.user.as_deref(), Some("system"));
++    assert!(phone.services.iter().any(|s| s.described.kind == Kind::Hidl
++        && s.described.name() == "android.hardware.wifi.supplicant@1.3::ISupplicant/default"));
++    assert!(phone.services.iter().any(|s| s.described.kind == Kind::Hidl
++        && s.described.name() == "vendor.qti.hardware.wifi.supplicant@2.2::ISupplicantVendor/default"));
++}
++
++#[test]
++fn system_as_root_services_are_read_below_the_filesystem_root() {
++    let root = tempfile::tempdir().unwrap();
++    std::fs::create_dir_all(root.path().join("system/etc/init")).unwrap();
++    let partition = Partition::mounted("system", root.path());
++    assert_eq!(partition.at, root.path().join("system"));
++    assert_eq!(partition.mounted, partition.at);
++    assert_eq!(Partition::mounted("vendor", root.path()).at, root.path());
++}
+diff --git a/crates/skyward-programs/tests/nabu/system/system/bin/hwservicemanager b/crates/skyward-programs/tests/nabu/system/system/bin/hwservicemanager
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/system/system/etc/init/hwservicemanager.rc b/crates/skyward-programs/tests/nabu/system/system/etc/init/hwservicemanager.rc
+new file mode 100644
+index 0000000..53d9de1
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/system/system/etc/init/hwservicemanager.rc
+@@ -0,0 +1,24 @@
++service hwservicemanager /system/bin/hwservicemanager
++    class early_hal core animation
++    user system
++    group system readproc
++# critical
++    file /dev/kmsg w
++    onrestart setprop hwservicemanager.ready false
++    onrestart class_restart --only-enabled main
++    onrestart class_restart --only-enabled hal
++    onrestart class_restart --only-enabled early_hal
++    task_profiles ServiceCapacityLow HighPerformance
++    shutdown critical
++
++on early-init
++# start hwservicemanager
++
++on init
++    start hwservicemanager
++
++on early-fs
++    start hwservicemanager
++
++on post-fs
++    start hwservicemanager
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.boot-service.nabu b/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.boot-service.nabu
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.boot@1.1-service b/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.boot@1.1-service
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti b/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.keymaster@4.1-service-qti b/crates/skyward-programs/tests/nabu/vendor/bin/hw/android.hardware.keymaster@4.1-service-qti
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/qseecomd b/crates/skyward-programs/tests/nabu/vendor/bin/qseecomd
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/bin/ssgtzd b/crates/skyward-programs/tests/nabu/vendor/bin/ssgtzd
+new file mode 100644
+index 0000000..e69de29
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot-service.nabu.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot-service.nabu.rc
+new file mode 100644
+index 0000000..f522c1f
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot-service.nabu.rc
+@@ -0,0 +1,5 @@
++service vendor.boot-hal-aidl /vendor/bin/hw/android.hardware.boot-service.nabu
++    class early_hal
++    user root
++    group root
++    seclabel u:r:hal_bootctl_default:s0
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot@1.1-service.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot@1.1-service.rc
+new file mode 100644
+index 0000000..83fa9d0
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.boot@1.1-service.rc
+@@ -0,0 +1,6 @@
++service vendor.boot-hal-1-1 /vendor/bin/hw/android.hardware.boot@1.1-service
++    interface android.hardware.boot@1.0::IBootControl default
++    interface android.hardware.boot@1.1::IBootControl default
++    class early_hal
++    user root
++    group root
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.gatekeeper@1.0-service-qti.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.gatekeeper@1.0-service-qti.rc
+new file mode 100644
+index 0000000..7a4c933
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.gatekeeper@1.0-service-qti.rc
+@@ -0,0 +1,10 @@
++on property:vendor.sys.listeners.registered=true
++    start gatekeeper-1-0
++
++service gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti
++    class hal
++    user system
++    group system drmrpc
++    interface android.hardware.gatekeeper@1.0::IGatekeeper default
++    disabled
++    oneshot
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.keymaster@4.1-service-qti.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.keymaster@4.1-service-qti.rc
+new file mode 100644
+index 0000000..64bcdfd
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/android.hardware.keymaster@4.1-service-qti.rc
+@@ -0,0 +1,11 @@
++on property:vendor.sys.listeners.registered=true
++    start keymaster-4-1
++
++service keymaster-4-1 /vendor/bin/hw/android.hardware.keymaster@4.1-service-qti
++    class hal
++    user system
++    group system drmrpc
++    interface android.hardware.keymaster@4.0::IKeymasterDevice default
++    interface android.hardware.keymaster@4.1::IKeymasterDevice default
++    disabled
++    oneshot
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/qseecomd.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/qseecomd.rc
+new file mode 100644
+index 0000000..af68dc2
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/qseecomd.rc
+@@ -0,0 +1,7 @@
++on post-fs-data
++    start vendor.qseecomd
++
++service vendor.qseecomd /vendor/bin/qseecomd
++    class core
++    user root
++    group root system drmrpc
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/init/ssgtzd.rc b/crates/skyward-programs/tests/nabu/vendor/etc/init/ssgtzd.rc
+new file mode 100644
+index 0000000..f9a4f5d
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/init/ssgtzd.rc
+@@ -0,0 +1,16 @@
++# Copyright (c) 2019 Qualcomm Technologies, Inc.
++# All Rights Reserved.
++# Confidential and Proprietary - Qualcomm Technologies, Inc.
++
++# Start daemon after boot completed
++on property:sys.boot_completed=1
++    start vendor.ssgtzd
++
++# Used 'disabled' flag, so daemon won't be started until explicit start
++service vendor.ssgtzd /vendor/bin/ssgtzd
++    class late_start
++    user system
++    group system
++    disabled
++    socket ssgtzd stream 0660 system inet
++    socket qwes_ipc stream 0660 system inet
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest.xml b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest.xml
+new file mode 100644
+index 0000000..cf9ffc3
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest.xml
+@@ -0,0 +1,440 @@
++<!--
++    Input:
++        manifest.xml
++        c2_manifest.xml
++-->
++<manifest version="2.0" type="device" target-level="5">
++    <hal format="hidl">
++        <name>android.hardware.audio</name>
++        <transport>hwbinder</transport>
++        <version>6.0</version>
++        <interface>
++            <name>IDevicesFactory</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@6.0::IDevicesFactory/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.audio.effect</name>
++        <transport>hwbinder</transport>
++        <version>6.0</version>
++        <interface>
++            <name>IEffectsFactory</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@6.0::IEffectsFactory/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.bluetooth</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IBluetoothHci</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IBluetoothHci/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.camera.provider</name>
++        <transport>hwbinder</transport>
++        <version>2.4</version>
++        <interface>
++            <name>ICameraProvider</name>
++            <instance>legacy/0</instance>
++        </interface>
++        <fqname>@2.4::ICameraProvider/legacy/0</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.gatekeeper</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IGatekeeper</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IGatekeeper/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.keymaster</name>
++        <transport>hwbinder</transport>
++        <version>4.1</version>
++        <interface>
++            <name>IKeymasterDevice</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@4.1::IKeymasterDevice/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.media.c2</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IComponentStore</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IComponentStore/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.media.omx</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IOmx</name>
++            <instance>default</instance>
++        </interface>
++        <interface>
++            <name>IOmxStore</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IOmx/default</fqname>
++        <fqname>@1.0::IOmxStore/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.memtrack</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IMemtrack</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IMemtrack/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.renderscript</name>
++        <transport arch="32+64">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDevice</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IDevice/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.sensors</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISensors</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ISensors/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.soundtrigger</name>
++        <transport>hwbinder</transport>
++        <version>2.2</version>
++        <interface>
++            <name>ISoundTriggerHw</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@2.2::ISoundTriggerHw/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.display.color</name>
++        <transport>hwbinder</transport>
++        <version>1.3</version>
++        <interface>
++            <name>IDisplayColor</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.3::IDisplayColor/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.display.postproc</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDisplayPostproc</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IDisplayPostproc/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.data.factory</name>
++        <transport>hwbinder</transport>
++        <version>2.1</version>
++        <interface>
++            <name>IFactory</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@2.1::IFactory/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.esepowermanager</name>
++        <transport>hwbinder</transport>
++        <version>1.1</version>
++        <interface>
++            <name>IEsePowerManager</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.1::IEsePowerManager/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.alarm</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IAlarm</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IAlarm/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.audiohalext</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IAudioHalExt</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IAudioHalExt/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.bluetooth_audio</name>
++        <transport>hwbinder</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IBluetoothAudioProvidersFactory</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@2.0::IBluetoothAudioProvidersFactory/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.bluetooth_sar</name>
++        <transport>hwbinder</transport>
++        <version>1.1</version>
++        <interface>
++            <name>IBluetoothSar</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.1::IBluetoothSar/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.btconfigstore</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IBTConfigStore</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IBTConfigStore/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.cacert</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IService</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IService/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.capabilityconfigstore</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ICapabilityConfigStore</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ICapabilityConfigStore/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.cryptfshw</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ICryptfsHw</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ICryptfsHw/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.dsp</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDspService</name>
++            <instance>dspservice</instance>
++        </interface>
++        <fqname>@1.0::IDspService/dspservice</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.factory</name>
++        <transport>hwbinder</transport>
++        <version>1.1</version>
++        <interface>
++            <name>IFactory</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.1::IFactory/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.iop</name>
++        <transport>hwbinder</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IIop</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@2.0::IIop/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.perf</name>
++        <transport>hwbinder</transport>
++        <version>2.2</version>
++        <interface>
++            <name>IPerf</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@2.2::IPerf/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.qccvndhal</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IQccvndhal</name>
++            <instance>qccvndhal</instance>
++        </interface>
++        <fqname>@1.0::IQccvndhal/qccvndhal</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.qseecom</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IQSEECom</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IQSEECom/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.qteeconnector</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IAppConnector</name>
++            <instance>default</instance>
++        </interface>
++        <interface>
++            <name>IGPAppConnector</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IAppConnector/default</fqname>
++        <fqname>@1.0::IGPAppConnector/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.sensorscalibrate</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISensorsCalibrate</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ISensorsCalibrate/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.soter</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISoter</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ISoter/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.tui_comm</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ITuiComm</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ITuiComm/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.vpp</name>
++        <transport>hwbinder</transport>
++        <version>1.3</version>
++        <interface>
++            <name>IHidlVppService</name>
++            <instance>vppService</instance>
++        </interface>
++        <fqname>@1.3::IHidlVppService/vppService</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.wifi.wifilearner</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IWifiStats</name>
++            <instance>wifiStats</instance>
++        </interface>
++        <fqname>@1.0::IWifiStats/wifiStats</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.imsrtpservice</name>
++        <transport>hwbinder</transport>
++        <version>3.0</version>
++        <interface>
++            <name>IRTPService</name>
++            <instance>imsrtpservice</instance>
++        </interface>
++        <fqname>@3.0::IRTPService/imsrtpservice</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.power.pasrmanager</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IPasrManager</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IPasrManager/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.xiaomi.hardware.citsensorservice</name>
++        <transport>hwbinder</transport>
++        <version>1.1</version>
++        <interface>
++            <name>ICitSensorService</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.1::ICitSensorService/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.xiaomi.hardware.displayfeature</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDisplayFeature</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::IDisplayFeature/default</fqname>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.xiaomi.hardware.touchfeature</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ITouchFeature</name>
++            <instance>default</instance>
++        </interface>
++        <fqname>@1.0::ITouchFeature/default</fqname>
++    </hal>
++    <sepolicy>
++        <version>30.0</version>
++    </sepolicy>
++    <kernel target-level="5"/>
++    <hal format="hidl">
++        <name>android.hidl.base</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IBase</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++</manifest>
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot-service.nabu.xml b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot-service.nabu.xml
+new file mode 100644
+index 0000000..048cdff
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot-service.nabu.xml
+@@ -0,0 +1,7 @@
++<manifest version="1.0" type="device">
++    <hal format="aidl">
++        <name>android.hardware.boot</name>
++        <version>1</version>
++        <fqname>IBootControl/default</fqname>
++    </hal>
++</manifest>
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot@1.1.xml b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot@1.1.xml
+new file mode 100644
+index 0000000..83d5d2e
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/android.hardware.boot@1.1.xml
+@@ -0,0 +1,7 @@
++<manifest version="1.0" type="device">
++    <hal format="hidl">
++        <name>android.hardware.boot</name>
++        <transport>hwbinder</transport>
++        <fqname>@1.1::IBootControl/default</fqname>
++    </hal>
++</manifest>
+diff --git a/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/manifest.xml b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/manifest.xml
+new file mode 100644
+index 0000000..98a21d9
+--- /dev/null
++++ b/crates/skyward-programs/tests/nabu/vendor/etc/vintf/manifest/manifest.xml
+@@ -0,0 +1,20 @@
++<manifest version="1.0" type="device">
++    <hal format="hidl">
++        <name>android.hardware.wifi.supplicant</name>
++        <transport>hwbinder</transport>
++        <version>1.3</version>
++        <interface>
++            <name>ISupplicant</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>vendor.qti.hardware.wifi.supplicant</name>
++        <transport>hwbinder</transport>
++        <version>2.2</version>
++        <interface>
++            <name>ISupplicantVendor</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++</manifest>
+diff --git a/crates/skyward-sys/src/ueventd.rs b/crates/skyward-sys/src/ueventd.rs
+index b46f2eb..cf6781c 100644
+--- a/crates/skyward-sys/src/ueventd.rs
++++ b/crates/skyward-sys/src/ueventd.rs
+@@ -2,14 +2,14 @@ use std::collections::HashMap;
+ 
+ /// Where the phone keeps the rules for its own device nodes, and the names
+ /// its own partitions give to the accounts those rules name.
+-pub const RULE_FILES: [&str; 2] = ["/vendor/etc/ueventd.rc", "/odm/etc/ueventd.rc"];
++pub const RULE_FILES: [&str; 4] = ["/vendor/ueventd.rc", "/vendor/etc/ueventd.rc", "/odm/ueventd.rc", "/odm/etc/ueventd.rc"];
+ pub const PASSWD_FILES: [&str; 2] = ["/vendor/etc/passwd", "/odm/etc/passwd"];
+ pub const GROUP_FILES: [&str; 2] = ["/vendor/etc/group", "/odm/etc/group"];
+ 
+ /// The accounts Android fixes once and for all. The rules, and the init
+ /// scripts of the phone's own programs, name them rather than their
+ /// numbers, and a recovery has no list of its own to look them up in.
+-const ACCOUNTS: [(&str, u32); 33] = [
++const ACCOUNTS: [(&str, u32); 36] = [
+     ("root", 0),
+     ("system", 1000),
+     ("radio", 1001),
+@@ -39,6 +39,9 @@ const ACCOUNTS: [(&str, u32); 33] = [
+     ("audioserver", 1041),
+     ("cameraserver", 1047),
+     ("shell", 2000),
++    ("inet", 3003),
++    ("net_raw", 3004),
++    ("net_admin", 3005),
+     ("readproc", 3009),
+     ("wakelock", 3010),
+     ("uhid", 3011),
+diff --git a/crates/skyward-ui/examples/frames.rs b/crates/skyward-ui/examples/frames.rs
+index 5bd3aee..82f77cd 100644
+--- a/crates/skyward-ui/examples/frames.rs
++++ b/crates/skyward-ui/examples/frames.rs
+@@ -339,6 +339,7 @@ fn info() -> DeviceInfo {
+     DeviceInfo {
+         model: "Xiaomi 13 Ultra".into(),
+         codename: "ishtar".into(),
++        maintainer: None,
+         soc: None,
+         cpu: Cpu { cores: 8, max_khz: Some(3_187_200) },
+         ram_kib: 15_556_972,
+diff --git a/crates/skyward-ui/src/app/act.rs b/crates/skyward-ui/src/app/act.rs
+index 1033f0c..21db79d 100644
+--- a/crates/skyward-ui/src/app/act.rs
++++ b/crates/skyward-ui/src/app/act.rs
+@@ -21,6 +21,16 @@ impl App {
+                 }
+                 return self.arrive_at(s);
+             }
++            Action::InstallBoot => {
++                if !self.state.boot_install_available {
++                    return Vec::new();
++                }
++                if !self.state.data.storage_open() {
++                    self.say(l.pick(["请先打开内部存储，以保存 boot 备份", "請先開啟內部儲存空間，以儲存 boot 備份", "Open internal storage first to save the boot backup"]), now);
++                    return Vec::new();
++                }
++                return self.install_opened("/system/etc/skyward/boot-installer.zip".into(), 0, now);
++            }
+             Action::OpenData => return self.open_data(),
+             Action::Skip => {
+                 self.leave(true);
+diff --git a/crates/skyward-ui/src/app/install.rs b/crates/skyward-ui/src/app/install.rs
+index ffb4f84..554c512 100644
+--- a/crates/skyward-ui/src/app/install.rs
++++ b/crates/skyward-ui/src/app/install.rs
+@@ -317,6 +317,20 @@ mod tests {
+     use crate::app::testing::*;
+     use skyward_install::Failure;
+ 
++    #[test]
++    fn boot_install_requires_storage_for_its_backup_and_uses_script_confirmation() {
++        let (f, i) = (fonts(), info());
++        let mut app = App::new(Screen::Install, W, H, PPD);
++        app.state.boot_install_available = true;
++        assert!(tap(&mut app, &f, &i, Action::InstallBoot).is_empty());
++        assert_eq!(app.screen(), Screen::Install);
++        app.state.data = Data::Open;
++        app.refresh();
++        assert_eq!(tap(&mut app, &f, &i, Action::InstallBoot), vec![Effect::InstallPath("/system/etc/skyward/boot-installer.zip".into())]);
++        assert_eq!(app.screen(), Screen::Installing);
++        assert!(matches!(app.state.install, Install::Checking { .. }));
++    }
++
+     #[test]
+     fn leaving_while_waiting_cancels_and_the_end_clears_it() {
+         let (f, i) = (fonts(), info());
+diff --git a/crates/skyward-ui/src/app/mod.rs b/crates/skyward-ui/src/app/mod.rs
+index c05e99f..c703bd3 100644
+--- a/crates/skyward-ui/src/app/mod.rs
++++ b/crates/skyward-ui/src/app/mod.rs
+@@ -325,6 +325,8 @@ pub enum Action {
+     EditEntry,
+     /// Install the file the file page shows.
+     InstallEntry,
++    /// Open the bundled recovery installer for the current boot slot.
++    InstallBoot,
+     /// Write the file the editor page shows as it now stands.
+     SaveText,
+     /// Open the page of the permissions of the entry the file page shows.
+diff --git a/crates/skyward-ui/src/app/state.rs b/crates/skyward-ui/src/app/state.rs
+index 24de4cc..cb08794 100644
+--- a/crates/skyward-ui/src/app/state.rs
++++ b/crates/skyward-ui/src/app/state.rs
+@@ -49,6 +49,7 @@ pub struct State {
+     /// The phone keeps its recovery in a partition of each slot, which the
+     /// install page then offers to keep Skyward in.
+     pub recovery_partitions: bool,
++    pub boot_install_available: bool,
+     /// Skyward goes back into the recovery partitions an install writes
+     /// over.
+     pub keep_recovery: bool,
+@@ -208,6 +209,7 @@ impl Default for State {
+             script_output: Vec::new(),
+             check_signature: false,
+             recovery_partitions: false,
++            boot_install_available: false,
+             keep_recovery: true,
+             reflash: None,
+             mounts: Ok(Vec::new()),
+diff --git a/crates/skyward-ui/src/app/testing.rs b/crates/skyward-ui/src/app/testing.rs
+index 04d86fa..257e904 100644
+--- a/crates/skyward-ui/src/app/testing.rs
++++ b/crates/skyward-ui/src/app/testing.rs
+@@ -18,6 +18,7 @@ pub(super) fn info() -> DeviceInfo {
+     DeviceInfo {
+         model: "Xiaomi 13 Ultra".into(),
+         codename: "ishtar".into(),
++        maintainer: None,
+         soc: None,
+         cpu: Cpu { cores: 8, max_khz: Some(3_187_200) },
+         ram_kib: 15_556_972,
+diff --git a/crates/skyward-ui/src/pages.rs b/crates/skyward-ui/src/pages.rs
+index 1951193..9eb5ecb 100644
+--- a/crates/skyward-ui/src/pages.rs
++++ b/crates/skyward-ui/src/pages.rs
+@@ -576,6 +576,16 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
+     let summary = widgets::facts(c, t, f, m.dp(490.7), &facts, &tone);
+     out.push(Hit { rect: summary.rows[1], action: Action::Open(Screen::Specs) });
+ 
++    let mut bottom = summary.bottom;
++    if let Some(maintainer) = &i.maintainer {
++        let credits = [
++            Fact { title: l.pick(["设备适配", "裝置適配", "Device maintainer"]), value: maintainer.name.clone(), link: false },
++            Fact { title: "GitHub", value: maintainer.github.clone(), link: false },
++            Fact { title: "X", value: maintainer.x.clone(), link: false },
++        ];
++        bottom = widgets::facts(c, t, f, bottom + m.card_gap, &credits, &tone).bottom;
++    }
++
+     let processor = soc(l, i).map_or_else(|| fmt::cpu(l, &i.cpu), str::to_string);
+     let mut specs = vec![(l.pick(PROCESSOR), processor), (l.pick(RAM), fmt::ram(i.ram_kib))];
+     if let Some(design) = i.battery.as_ref().and_then(|b| b.design) {
+@@ -587,7 +597,7 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
+     if let Some(p) = i.panel {
+         specs.push((l.pick(RESOLUTION), fmt::panel(p)));
+     }
+-    let y = widgets::spec_card(c, t, f, summary.bottom + m.card_gap, &fmt::model_lines(&i.model), &specs, &tone);
++    let y = widgets::spec_card(c, t, f, bottom + m.card_gap, &fmt::model_lines(&i.model), &specs, &tone);
+     let links = widgets::list_toned(c, t, f, y + m.card_gap, &[Row::new(l.pick(SPECS)), Row::new(l.pick(LOGS))], &tone);
+     out.extend(hits(&links.rows, &[Action::Open(Screen::Specs), Action::Open(Screen::Logs)]));
+     (out, summary.rows[0].y, links.bottom)
+@@ -938,6 +948,19 @@ pub fn install(cx: &Ctx) -> Frame {
+         ]);
+         y = widgets::footnote(&mut c, t, f, options.bottom, note);
+     }
++    if cx.state.boot_install_available {
++        let installer = widgets::list(&mut c, t, f, y + t.m.card_gap, &[
++            Row::new(l.pick(["安装 Skyward 到 boot", "安裝 Skyward 到 boot", "Install Skyward to boot"]))
++                .icon(PURPLE, Icon::Shield)
++                .subtitle(l.pick(["备份当前槽位 boot 后安装，保留现有内核", "備份目前槽位 boot 後安裝，保留現有核心", "Back up the current boot slot and keep its kernel"])),
++        ]);
++        out.extend(hits(&installer.rows, &[Action::InstallBoot]));
++        y = widgets::footnote(&mut c, t, f, installer.bottom, l.pick([
++            "适用于没有独立 recovery 分区的设备。原始 boot 将保存到内部存储 Skyward/boot-backups；滑动确认后写入当前槽位，完成后可重启到系统或 Recovery。",
++            "適用於沒有獨立 recovery 分割區的裝置。原始 boot 將儲存到內部儲存空間 Skyward/boot-backups；滑動確認後寫入目前槽位，完成後可重新啟動至系統或 Recovery。",
++            "For devices with recovery in boot. The original boot is saved in internal storage under Skyward/boot-backups. Slide to confirm writing the current slot, then reboot to system or recovery.",
++        ]));
++    }
+     Frame::new(t, fit(c, t, y), out, l.pick(["安装", "安裝", "Install"]), top)
+ }
+ 
+diff --git a/crates/skyward/src/keys.rs b/crates/skyward/src/keys.rs
+index f4b7775..ac4bff2 100644
+--- a/crates/skyward/src/keys.rs
++++ b/crates/skyward/src/keys.rs
+@@ -19,6 +19,9 @@ pub struct Found {
+     /// what the recovery's is told of, so that each of the phone's
+     /// programs registers there all it registers on the phone.
+     pub described: Vec<String>,
++    /// HIDL supplicant services declared by the installed vendor. The
++    /// services used for keys are already named in the startup steps.
++    pub hardware: Vec<String>,
+     /// What to do to use the phone's keys, in order, or why the partitions
+     /// do not say.
+     pub steps: Result<Vec<Step>>,
+@@ -40,7 +43,12 @@ pub fn found(slot: skyward_vab::Slot, libraries: Option<&Path>) -> Result<Found>
+         name(&unnamed)?;
+         phone = read(slot, libraries)?;
+     }
+-    Ok(Found { described: phone.told_of(), steps: secure::steps(&phone) })
++    let hardware = phone.services.iter()
++        .filter(|s| s.described.kind == skyward_programs::description::Kind::Hidl)
++        .map(|s| s.described.name())
++        .filter(|name| name.contains("wifi.supplicant@"))
++        .collect();
++    Ok(Found { described: phone.told_of(), hardware, steps: secure::steps(&phone) })
+ }
+ 
+ /// The phone as the partitions of the slot's installed system describe it,
+diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
+index c770fe4..2d81930 100644
+--- a/crates/skyward/src/main.rs
++++ b/crates/skyward/src/main.rs
+@@ -57,6 +57,19 @@ struct Cli {
+ 
+ #[derive(Subcommand)]
+ enum Cmd {
++    /// Install the packaged recovery ramdisk into the current boot slot.
++    InstallBoot {
++        #[arg(long, default_value = "/")]
++        root: PathBuf,
++        #[arg(long)]
++        package: PathBuf,
++        /// A boot image for an offline preparation check; requires --out.
++        #[arg(long, requires = "out")]
++        source: Option<PathBuf>,
++        /// Write the prepared image to a regular file instead of flashing.
++        #[arg(long)]
++        out: Option<PathBuf>,
++    },
+     /// Print what the About page shows, plus a partition summary.
+     Info {
+         /// Device configuration, e.g. devices/nezha.toml.
+@@ -236,6 +249,22 @@ fn main() -> Result<()> {
+         std::process::exit(code);
+     }
+     match Cli::parse().cmd {
++        Cmd::InstallBoot { package, source, out, root } => {
++            if let Some(out) = out {
++                let source = source.context("an offline preparation requires --source")?;
++                let stock = std::fs::read(source)?;
++                let package = std::fs::read(package)?;
++                let image = skyward_install::boot::prepare_from_root(&stock, &package, stock.len(), "nabu", &root)?;
++                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(out)?;
++                std::io::Write::write_all(&mut file, &image)?;
++                println!("Prepared boot image; the installed partitions were not written");
++                return Ok(());
++            }
++            #[cfg(target_os = "android")]
++            { skyward_install::boot::install_running(&package) }
++            #[cfg(not(target_os = "android"))]
++            { anyhow::bail!("boot installation runs inside recovery; use --source and --out for an offline check") }
++        },
+         Cmd::Info { config } => info(&config),
+         Cmd::Slot => slot(),
+         Cmd::Modules { source } => modules(&source),
+@@ -534,7 +563,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+     // The drivers ask for their firmware by name, and the kernel looks only
+     // in folders of its own unless told to pass on what it does not find
+     // there to ueventd, which looks in the recovery's firmware folders.
+-    std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
++    // Older vendor kernels enable the user-helper fallback at build time
++    // and do not expose the later firmware_config sysctl.
++    if let Err(e) = std::fs::write(FIRMWARE_FALLBACK, "1")
++        && e.kind() != std::io::ErrorKind::NotFound
++    {
++        return Err(e).with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"));
++    }
+     if let Some(firmware) = &cfg.firmware {
+         mount_firmware(&firmware.partition)?;
+     }
+@@ -551,16 +586,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+     }
+     // What the phone describes is known wherever its partitions could be
+     // read at all; what they say of its keys may still not be.
+-    let (described, found) = match found {
+-        Ok(found) => (found.described, found.steps),
+-        Err(e) => (Vec::new(), Err(e)),
++    let (described, described_hardware, found) = match found {
++        Ok(found) => (found.described, found.hardware, found.steps),
++        Err(e) => (Vec::new(), Vec::new(), Err(e)),
+     };
+     // What either service directory has to know of, it has to know before
+     // anything registers with it, so both are told of the configuration's
+     // programs and of those that use the phone's keys together.
+     let key_programs = found.as_deref().map(keys::programs).unwrap_or_default();
+     let programs = || services.iter().map(|p| &p.service).chain(&key_programs);
+-    let hardware: Vec<String> = programs().filter_map(|s| s.ready_hardware_service.clone()).collect();
++    let hardware: Vec<String> = programs()
++        .filter_map(|s| s.ready_hardware_service.clone())
++        .chain(described_hardware)
++        .collect();
+     if !hardware.is_empty() {
+         secure::prepare_hardware_directory(&hardware)?;
+         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
+@@ -575,7 +613,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+     if found.as_deref().is_ok_and(keys::serves_elements) {
+         registering.push(skyward_omapi::SERVICE.to_string());
+     }
+-    registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
++    registering.extend(cfg.wlan.iter().filter(|w| !w.service.is_empty()).map(|w| w.service.clone()));
+     // A program may register more than the recovery waits for, as the
+     // WLAN's supplicant registers its maker's own service beside
+     // Android's, and ends where the directory turns one of them away. So
+@@ -597,7 +635,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+         skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
+     }
+     keys::start(&steps)?;
+-    agree_on_the_notes_key(&registering)
++    let legacy_keys = skyward_programs::secure::programs(&steps).iter()
++        .any(|p| p.service.path == skyward_programs::secure::KEYMASTER_COMPAT);
++    agree_on_the_notes_key(&registering, legacy_keys)
+ }
+ 
+ /// How long a file handed over may take to be there once the modules are
+@@ -667,9 +707,12 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
+ /// credential service cannot write a note the key service will take, and
+ /// the keys the phone guards behind a screen lock stay unusable.
+ #[cfg(target_os = "android")]
+-fn agree_on_the_notes_key(registered: &[String]) -> Result<()> {
++fn agree_on_the_notes_key(registered: &[String], legacy_keys: bool) -> Result<()> {
+     let interface = format!("{}/", skyward_crypto::sharedsecret::INTERFACE);
+-    let names: Vec<String> = registered.iter().filter(|n| n.starts_with(&interface)).cloned().collect();
++    let mut names: Vec<String> = registered.iter().filter(|n| n.starts_with(&interface)).cloned().collect();
++    if legacy_keys {
++        names.push(skyward_crypto::compat::SERVICE.into());
++    }
+     if names.is_empty() {
+         return Ok(());
+     }
+diff --git a/crates/skyward/src/secure.rs b/crates/skyward/src/secure.rs
+index deefa91..85f76a1 100644
+--- a/crates/skyward/src/secure.rs
++++ b/crates/skyward/src/secure.rs
+@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
+ 
+ /// Where a phone keeps the bundles of shared libraries its own partitions
+ /// were built against.
+-const BUNDLE_DIRS: [&str; 4] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex"];
++const BUNDLE_DIRS: [&str; 7] = [
++    "/system_ext/apex", "/mnt/system_ext/apex", "/mnt/system/system/apex",
++    "/mnt/system/apex", "/product/apex", "/mnt/product/apex", "/vendor/apex",
++];
+ 
+ /// The file inside a bundle that holds its filesystem. It is stored whole,
+ /// so the bundle can be opened where it lies.
+@@ -141,7 +144,11 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+ /// holds the two.
+ fn describe_hardware(wanted: &[String]) -> Result<String> {
+     let mut out = String::from("<manifest version=\"1.0\" type=\"framework\">\n");
++    let mut seen = BTreeSet::new();
+     for name in std::iter::once(HARDWARE_DIRECTORY).chain(wanted.iter().map(String::as_str)) {
++        if !seen.insert(name) {
++            continue;
++        }
+         let (package, rest) = name
+             .split_once('@')
+             .with_context(|| format!("{name} does not read as a hardware service's name"))?;
+diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
+index 8ed3ceb..38ea835 100644
+--- a/crates/skyward/src/ui.rs
++++ b/crates/skyward/src/ui.rs
+@@ -18,7 +18,7 @@ use crate::wlan;
+ use anyhow::{anyhow, ensure, Context, Result};
+ use skyward_block::fsck::Fixed;
+ use skyward_block::{fstab, mount, probe};
+-use skyward_config::{DeviceConfig, Service};
++use skyward_config::{ramdisk, DeviceConfig, Service};
+ use skyward_crypto::data::{Closed, Opened};
+ use skyward_install::asked::{self, Needs};
+ use skyward_install::{Detach, Installer, Options};
+@@ -155,28 +155,58 @@ fn normal_max(max: u32) -> Result<u32> {
+     // without the colon either.
+     let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
+     let soc = Path::new("/proc/device-tree/soc");
+-    let node = fs::read_dir(soc)
+-        .with_context(|| format!("read {}", soc.display()))?
+-        .map(|e| e.map(|e| e.path().join(name)))
+-        .collect::<std::io::Result<Vec<_>>>()?
+-        .into_iter()
+-        .find(|p| p.is_dir())
+-        .ok_or_else(|| anyhow!("panel {name} is not in the device tree"))?;
++    let node = panel_node(soc, name)?;
+     let cell = |prop: &str| -> Result<u32> {
+         let path = node.join(prop);
+         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+         let cell: [u8; 4] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is not one cell", path.display()))?;
+         Ok(u32::from_be_bytes(cell))
+     };
+-    let (normal, full) = NORMAL_MAX
+-        .iter()
+-        .find(|(normal, _)| node.join(normal).exists())
+-        .with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
++    let levels = NORMAL_MAX.iter().find(|(normal, _)| node.join(normal).exists());
++    // nabu's LCD uses a WLED backlight with no separate OLED HBM range.
++    if levels.is_none()
++        && fs::read(node.join("qcom,mdss-dsi-bl-pmic-control-type")).ok().as_deref() == Some(b"bl_ctrl_wled\0")
++    {
++        ensure!(max > 0, "panel {name}: zero backlight maximum");
++        return Ok(max);
++    }
++    let (normal, full) = levels.with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
+     let (normal, full) = (cell(normal)?, cell(full)?);
+     ensure!(normal > 0 && normal <= full, "panel {name}: normal maximum {normal} out of {full}");
+     Ok((f64::from(max) * f64::from(normal) / f64::from(full)).round() as u32)
+ }
+ 
++/// Newer drivers name the panel node directly. SM8150 names a display's
++/// label instead; that display's qcom,dsi-panel phandle selects the panel.
++fn panel_node(soc: &Path, name: &str) -> Result<PathBuf> {
++    let children = |dir: &Path| -> Result<Vec<PathBuf>> {
++        let mut paths = Vec::new();
++        for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
++            let entry = entry?;
++            if entry.file_type()?.is_dir() {
++                paths.push(entry.path());
++            }
++        }
++        Ok(paths)
++    };
++    let mut nodes = children(soc)?;
++    for parent in nodes.clone() {
++        nodes.extend(children(&parent)?);
++    }
++    if let Some(node) = nodes.iter().find(|p| p.file_name().is_some_and(|n| n == name)) {
++        return Ok(node.clone());
++    }
++    let label = format!("{name}\0").into_bytes();
++    if let Some(display) = nodes.iter().find(|p| fs::read(p.join("label")).ok().as_ref() == Some(&label)) {
++        let handle = fs::read(display.join("qcom,dsi-panel")).context("read display panel phandle")?;
++        ensure!(handle.len() == 4, "display {name}: invalid panel phandle");
++        if let Some(panel) = nodes.iter().find(|p| fs::read(p.join("phandle")).ok().as_ref() == Some(&handle)) {
++            return Ok(panel.clone());
++        }
++    }
++    anyhow::bail!("panel {name} is not in the device tree")
++}
++
+ /// Leave recovery for the chosen target.
+ fn power(target: Target) -> Result<()> {
+     skyward_sys::power(match target {
+@@ -1341,6 +1371,7 @@ impl<'a> Pages<'a> {
+         let by_name = Path::new(skyward_block::BY_NAME);
+         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
+         app.state.recovery_partitions = both("recovery")?;
++        app.state.boot_install_available = cfg.device.recovery_in_boot && Path::new("/").join(ramdisk::BOOT_INSTALLER).is_file();
+         app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+         // The second system's work; the systems are read at once, for the home
+         // page to name the one that starts, once a switch cut off before is
+@@ -2519,7 +2550,10 @@ impl Pages<'_> {
+             }
+             Effect::InstallPath(path) => {
+                 if self.may_install(now)? {
+-                    self.installer = Some(Installer::open(PathBuf::from(path), detach(self.programs.to_vec()), install_options(&self.app))?);
++                    let bundled = cfg.device.recovery_in_boot && path == format!("/{}", ramdisk::BOOT_INSTALLER);
++                    let options = if bundled { Options { keep: false, signed: false } } else { install_options(&self.app) };
++                    let move_off: Detach = if bundled { Box::new(|| Ok(())) } else { detach(self.programs.to_vec()) };
++                    self.installer = Some(Installer::open(PathBuf::from(path), move_off, options)?);
+                 }
+             }
+             Effect::Flash { partition, pick } => {
