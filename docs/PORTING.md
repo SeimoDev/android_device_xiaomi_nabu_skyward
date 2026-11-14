@@ -13,6 +13,8 @@ The bundled boot installer rebuilds the current slot's boot with its own kernel 
 
 The SM8150 display parameter identifies a display label. The patch resolves that label and the `qcom,dsi-panel` phandle to find the panel node. LCD brightness uses the WLED range. Eight original Novatek touch firmware files are copied into the recovery's own firmware directory so they remain accessible after vendor mounts.
 
+The saved brightness is applied after the first display commit has completed, including an initial forced backlight synchronization.
+
 ## Android services
 
 Linux 4.14 loop devices use `LOOP_SET_FD` and `LOOP_SET_STATUS64` when `LOOP_CONFIGURE` is unavailable. VNDK 30 is loaded from system_ext APEX. The base libbinder uses `SYST` interface-token headers. A servicemanager wrapper uses a private mount namespace to read the recovery-generated framework service declarations with its older libvintf.
@@ -25,7 +27,7 @@ The kernel includes ICNSS and the WLAN host driver. The WLAN firmware runs in `m
 
 ## Internal storage
 
-The tested ROM disables both file and metadata encryption. The recovery mounts its plain F2FS userdata partition, checks the actual directory encryption policy and binds `/data/media/0` to `/sdcard`. Internal storage can then be browsed in the file manager.
+The tested ROM disables both file and metadata encryption. On a normal recovery start, the recovery automatically mounts its plain F2FS userdata partition, checks the actual directory encryption policy and binds `/data/media/0` to `/sdcard`. Internal storage can then be browsed in the file manager.
 
 ## Maintainer information
 

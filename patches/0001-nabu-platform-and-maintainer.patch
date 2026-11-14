@@ -74,6 +74,45 @@ index 0e6e510..5530906 100644
      #[test]
      fn a_call_opens_with_the_header_and_the_interface_name() {
          let p = Parcel::call("a.b.IC");
+diff --git a/crates/skyward-block/src/fstab.rs b/crates/skyward-block/src/fstab.rs
+index f75cbad..c03d54b 100644
+--- a/crates/skyward-block/src/fstab.rs
++++ b/crates/skyward-block/src/fstab.rs
+@@ -29,6 +29,12 @@ impl Entry {
+     }
+ }
+ 
++/// Whether every candidate explicitly leaves both forms of data
++/// encryption disabled. An absent table never authorizes automatic access.
++pub fn unencrypted(entries: &[Entry]) -> bool {
++    !entries.is_empty() && entries.iter().all(|e| ["fileencryption", "metadata_encryption", "encryptable", "forceencrypt", "forcefdeorfbe"].iter().all(|key| e.extra(key).is_none()))
++}
++
+ /// Every filesystem a table names. A phone may name the same mount point
+ /// more than once, once per filesystem it might hold.
+ pub fn entries(text: &str) -> Vec<Entry> {
+@@ -167,3 +173,21 @@ mod tests {
+         assert_eq!(entries(TABLE).len(), 3);
+     }
+ }
++
++#[cfg(test)]
++mod encryption_tests {
++    use super::*;
++    #[test]
++    fn automatic_mount_requires_candidates_without_either_encryption_layer() {
++        let entry = |flags: &str| entries(&format!("/dev/block/by-name/userdata /data f2fs nosuid,nodev wait,{flags}"));
++        assert!(unencrypted(&entry("check")));
++        assert!(!unencrypted(&[]));
++        assert!(!unencrypted(&entry("fileencryption=aes-256-xts:aes-256-cts:v2")));
++        assert!(!unencrypted(&entry("metadata_encryption=aes-256-xts")));
++        assert!(!unencrypted(&entry("forceencrypt=footer")));
++        assert!(!unencrypted(&entry("encryptable=footer")));
++        let mut alternatives = entry("check");
++        alternatives.extend(entry("fileencryption=aes-256-xts"));
++        assert!(!unencrypted(&alternatives));
++    }
++}
 diff --git a/crates/skyward-block/src/loopdev.rs b/crates/skyward-block/src/loopdev.rs
 index ab782de..dc45d45 100644
 --- a/crates/skyward-block/src/loopdev.rs
@@ -2046,7 +2085,7 @@ index deefa91..85f76a1 100644
              .split_once('@')
              .with_context(|| format!("{name} does not read as a hardware service's name"))?;
 diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
-index 8ed3ceb..38ea835 100644
+index 8ed3ceb..7a46fdd 100644
 --- a/crates/skyward/src/ui.rs
 +++ b/crates/skyward/src/ui.rs
 @@ -18,7 +18,7 @@ use crate::wlan;
@@ -2058,7 +2097,36 @@ index 8ed3ceb..38ea835 100644
  use skyward_crypto::data::{Closed, Opened};
  use skyward_install::asked::{self, Needs};
  use skyward_install::{Detach, Installer, Options};
-@@ -155,28 +155,58 @@ fn normal_max(max: u32) -> Result<u32> {
+@@ -87,6 +87,7 @@ struct Backlight {
+     top: u32,
+     /// The raw level last written; at first the one the bootloader left.
+     level: u32,
++    synced: bool,
+ }
+ 
+ impl Backlight {
+@@ -112,17 +113,18 @@ impl Backlight {
+         };
+         let top = normal_max(read("max_brightness")?)?;
+         let level = read("brightness")?;
+-        Ok(Backlight { path: dir.join("brightness"), top, level })
++        Ok(Backlight { path: dir.join("brightness"), top, level, synced: false })
+     }
+ 
+     /// Light the panel at `level` of its normal maximum, or turn it off
+     /// with `None`. The file is written only when the raw level changes.
+     fn show(&mut self, level: Option<f32>) -> Result<()> {
+         let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
+-        if raw != self.level {
++        if !self.synced || raw != self.level {
+             fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
+             eprintln!("backlight {raw}");
+             self.level = raw;
++            self.synced = true;
+         }
+         Ok(())
+     }
+@@ -155,28 +157,58 @@ fn normal_max(max: u32) -> Result<u32> {
      // without the colon either.
      let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
      let soc = Path::new("/proc/device-tree/soc");
@@ -2128,7 +2196,7 @@ index 8ed3ceb..38ea835 100644
  /// Leave recovery for the chosen target.
  fn power(target: Target) -> Result<()> {
      skyward_sys::power(match target {
-@@ -1341,6 +1371,7 @@ impl<'a> Pages<'a> {
+@@ -1341,6 +1373,7 @@ impl<'a> Pages<'a> {
          let by_name = Path::new(skyward_block::BY_NAME);
          let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
          app.state.recovery_partitions = both("recovery")?;
@@ -2136,7 +2204,33 @@ index 8ed3ceb..38ea835 100644
          app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
          // The second system's work; the systems are read at once, for the home
          // page to name the one that starts, once a switch cut off before is
-@@ -2519,7 +2550,10 @@ impl Pages<'_> {
+@@ -1510,6 +1543,16 @@ impl<'a> Pages<'a> {
+             }
+             Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
+         }
++        // Plain userdata needs no credential page. Leave partitions alone
++        // during work such as wiping, fastboot or a system-requested update.
++        if matches!(self.request.work, Work::Menu)
++            && self.decryptor.is_none()
++            && skyward_block::fstab::read("/data").is_ok_and(|entries| skyward_block::fstab::unencrypted(&entries))
++        {
++            self.app.state.data = skyward_ui::app::Data::Opening;
++            self.app.refresh();
++            self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
++        }
+         // A switch asked for finishes one cut off before itself; fastboot leaves
+         // /metadata to fastbootd until the recovery's pages come up.
+         if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
+@@ -1714,7 +1757,7 @@ impl<'a> Pages<'a> {
+         // After the frame is on the panel, so a panel coming back on lights
+         // with what it should show now, never with what it showed when it
+         // went off.
+-        if self.backlight.level == 0 && panel.is_some() {
++        if (!self.backlight.synced || self.backlight.level == 0) && panel.is_some() {
+             self.surface.settle()?;
+         }
+         self.backlight.show(panel)?;
+@@ -2519,7 +2562,10 @@ impl Pages<'_> {
              }
              Effect::InstallPath(path) => {
                  if self.may_install(now)? {

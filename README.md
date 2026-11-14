@@ -74,12 +74,12 @@ On an unlocked nabu with the tested ROM installed, temporarily boot the download
 fastboot boot skyward-nabu-boot.img
 ```
 
-Open **Data decryption** to mount internal storage, then use **File manager** to browse the existing files. Maintainer details are under **Settings → About phone**. This release has been tested through temporary boot. Flashing, formatting and OTA installation have separate effects on the installed system and require their own validation.
+Unencrypted internal storage opens automatically. Use **File manager** to browse the existing files. Maintainer details are under **Settings → About phone**. This release has been tested through temporary boot. Flashing, formatting and OTA installation have separate effects on the installed system and require their own validation.
 
 ## Install recovery into boot
 
 1. Temporarily boot the image with `fastboot boot skyward-nabu-boot.img`.
-2. Open **Data decryption** so internal storage is available for the backup.
+2. Wait for internal storage to open automatically so it is available for the backup.
 3. Open **Install → Install Skyward to boot** and slide to confirm the bundled installer.
 4. The installer verifies the device, unlocked bootloader, kernel and update state; backs up the complete current boot partition to `Skyward/boot-backups`; replaces its recovery ramdisk; writes the current slot and verifies the contents by reading them back.
 5. Reboot to **System** for Android, or **Recovery** for Skyward.
