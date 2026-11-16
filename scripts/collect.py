@@ -66,6 +66,14 @@ def main():
             if source.parent != search[0]:
                 copy(source, "system/lib64/" + name)
             queue.append(source)
+    # Vendor-specific fallback libraries must follow the installed ROM at boot.
+    runtime = [r for r in records if r["source"].startswith("vendor/")
+               and (r["destination"].startswith("system/lib64/")
+                    or r["source"] == "vendor/etc/wifi/WCNSS_qcom_cfg.ini")]
+    runtime_file = args.overlay / "system/etc/skyward/vendor-runtime.files"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text("".join("/" + r["source"] + "\t/" + r["destination"] + "\n" for r in runtime))
+    runtime_file.chmod(0o644)
     manifest = args.overlay.parent / "materials.json"
     manifest.write_text(json.dumps({"files": records}, ensure_ascii=False, indent=2) + "\n")
     print(f"Collected {len(records)} files; resolved {len(seen)} shared libraries")

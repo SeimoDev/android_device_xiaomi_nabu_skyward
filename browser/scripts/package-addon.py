@@ -11,10 +11,17 @@ parser.add_argument('runtime', type=Path)
 parser.add_argument('output', type=Path)
 args = parser.parse_args()
 args.output.parent.mkdir(parents=True, exist_ok=True)
+def runtime_permissions(info):
+    if info.isdir():
+        info.mode |= 0o755
+    elif info.isfile():
+        info.mode |= 0o644
+    return info
+
 with tempfile.TemporaryDirectory(prefix='skyward-browser-') as tmp:
     packed = Path(tmp) / 'runtime.tar.gz'
     with tarfile.open(packed, 'w:gz') as tar:
-        tar.add(args.runtime, arcname='.')
+        tar.add(args.runtime, arcname='.', filter=runtime_permissions)
     with ZipFile(args.output, 'w', compression=ZIP_STORED) as archive:
         info = ZipInfo('META-INF/com/google/android/update-binary')
         info.external_attr = 0o100755 << 16

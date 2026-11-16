@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ee5530e..be0ce9a 100644
+index ee5530e..4488f91 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -2370,6 +2370,8 @@ dependencies = [
@@ -22,7 +22,15 @@ index ee5530e..be0ce9a 100644
   "tempfile",
  ]
  
-@@ -2597,6 +2601,7 @@ dependencies = [
+@@ -2512,6 +2516,7 @@ dependencies = [
+  "skyward-sys",
+  "skyward-systems",
+  "skyward-vab",
++ "tar",
+  "tempfile",
+  "x509-cert",
+  "zerocopy",
+@@ -2597,6 +2602,7 @@ dependencies = [
   "skyward-programs",
   "tempfile",
   "unpayload",
@@ -30,6 +38,14 @@ index ee5530e..be0ce9a 100644
  ]
  
  [[package]]
+@@ -2703,6 +2709,7 @@ name = "skyward-vab"
+ version = "0.3.1"
+ dependencies = [
+  "anyhow",
++ "crc32fast",
+  "libc",
+  "prost",
+  "skyward-binder",
 diff --git a/crates/skyward-binder/src/parcel.rs b/crates/skyward-binder/src/parcel.rs
 index 0e6e510..5530906 100644
 --- a/crates/skyward-binder/src/parcel.rs
@@ -312,6 +328,60 @@ index ab782de..f08e039 100644
 +        std::fs::remove_dir_all(dir).unwrap();
 +    }
 +}
+diff --git a/crates/skyward-block/src/mount.rs b/crates/skyward-block/src/mount.rs
+index 0f7f6ac..9365ce2 100644
+--- a/crates/skyward-block/src/mount.rs
++++ b/crates/skyward-block/src/mount.rs
+@@ -45,6 +45,18 @@ pub fn split_options(options: &[String]) -> (u64, String) {
+     (flags, own.join(","))
+ }
+ 
++/// A vendor mount label may name types absent from a recovery's policy.
++/// Retry with the recovery's filesystem labels only while SELinux is permissive.
++#[cfg(any(target_os = "android", test))]
++fn recovery_labels(options: &[String], permissive: bool) -> Option<Vec<String>> {
++    if !permissive { return None; }
++    let kept: Vec<String> = options.iter().filter(|word| {
++        let name = word.split_once('=').map_or(word.as_str(), |(name, _)| name);
++        !matches!(name, "context" | "fscontext" | "defcontext" | "rootcontext")
++    }).cloned().collect();
++    (kept.len() != options.len()).then_some(kept)
++}
++
+ /// The mount that shows at a mount point.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Visible {
+@@ -138,7 +150,15 @@ mod sys {
+         let ty = CString::new(filesystem).with_context(|| format!("{filesystem} holds a NUL"))?;
+         let data = CString::new(own.as_str()).with_context(|| format!("{own} holds a NUL"))?;
+         if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), flags as libc::c_ulong, data.as_ptr().cast()) } != 0 {
+-            return Err(os_error())
++            let error = os_error();
++            if error.raw_os_error() == Some(libc::EINVAL) {
++                let permissive = fs::read_to_string("/sys/fs/selinux/enforce").is_ok_and(|value| value.trim() == "0");
++                if let Some(kept) = super::recovery_labels(options, permissive) {
++                    eprintln!("mount {} on {} with recovery filesystem labels", device.display(), target.display());
++                    return mount(device, target, filesystem, &kept);
++                }
++            }
++            return Err(error)
+                 .with_context(|| format!("mount {} on {} as {filesystem} with {}", device.display(), target.display(), options.join(",")));
+         }
+         Ok(())
+@@ -501,6 +521,13 @@ pub use sys::{
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn vendor_labels_are_only_retried_in_a_permissive_recovery() {
++        let options = ["ro", "uid=1000", "gid=1000", "dmask=227", "context=u:object_r:firmware_file:s0"].map(str::to_owned);
++        assert_eq!(super::recovery_labels(&options, true).unwrap(), options[..4]);
++        assert_eq!(super::recovery_labels(&options, false), None);
++        assert_eq!(super::recovery_labels(&options[..4], true), None);
++    }
+     use super::*;
+ 
+     #[test]
 diff --git a/crates/skyward-bootimg/Cargo.toml b/crates/skyward-bootimg/Cargo.toml
 index c34a04d..87e915f 100644
 --- a/crates/skyward-bootimg/Cargo.toml
@@ -582,10 +652,26 @@ index 53903a5..d3615b2 100644
      let mut closed = Vec::new();
      let mut owner = Note::default();
 diff --git a/crates/skyward-crypto/src/keymint.rs b/crates/skyward-crypto/src/keymint.rs
-index 95d6d7f..c2de6b2 100644
+index 95d6d7f..0cc228a 100644
 --- a/crates/skyward-crypto/src/keymint.rs
 +++ b/crates/skyward-crypto/src/keymint.rs
-@@ -128,8 +128,10 @@ pub struct KeyMint<'a> {
+@@ -41,7 +41,6 @@ const PADDING_NONE: i32 = 1;
+ 
+ /// What a key parameter is tagged with. The high bits say which kind of
+ /// value follows, which is why the numbers look arbitrary.
+-const TAG_PURPOSE: i32 = 536_870_913;
+ const TAG_BLOCK_MODE: i32 = 536_870_916;
+ const TAG_PADDING: i32 = 536_870_918;
+ const TAG_MAC_LENGTH: i32 = 805_307_371;
+@@ -50,7 +49,6 @@ const TAG_NONCE: i32 = -1_879_047_191;
+ 
+ /// Which arm of a parameter's value is used.
+ const VALUE_PADDING_MODE: i32 = 3;
+-const VALUE_KEY_PURPOSE: i32 = 7;
+ const VALUE_INTEGER: i32 = 11;
+ const VALUE_BLOB: i32 = 14;
+ const VALUE_BLOCK_MODE: i32 = 2;
+@@ -128,8 +126,10 @@ pub struct KeyMint<'a> {
  impl<'a> KeyMint<'a> {
      /// Reach the running key service, or say that none is.
      pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
@@ -598,6 +684,56 @@ index 95d6d7f..c2de6b2 100644
          Ok(KeyMint { device })
      }
  
+@@ -213,6 +213,17 @@ impl<'a> KeyMint<'a> {
+     /// something that looks like a key. A key guarded by a screen lock
+     /// takes the note the secure world wrote when it was answered.
+     pub fn gcm_decrypt(&self, key_blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8], note: Option<&Token>) -> Result<Vec<u8>> {
++        // Some legacy Keymaster implementations report an old blob accurately
++        // through getKeyCharacteristics but return INVALID_ARGUMENT from begin.
++        // Renew it in memory using only the application's binding parameters.
++        let renewed = match self.authorizations(key_blob, app_id) {
++            Err(e) if status::refused_with(&e) == Some(KEY_REQUIRES_UPGRADE) => {
++                Some(self.upgrade(key_blob, |call| Self::binding_params(call, app_id))
++                    .context("renew the wrapping key for the firmware running now")?)
++            }
++            _ => None,
++        };
++        let key_blob = renewed.as_deref().unwrap_or(key_blob);
+         let operation = match self.begin(key_blob, app_id, nonce, note) {
+             Ok(operation) => operation,
+             Err(e) if status::refused_with(&e) == Some(KEY_REQUIRES_UPGRADE) => {
+@@ -221,7 +232,7 @@ impl<'a> KeyMint<'a> {
+                 // now; the one on disk is left as it is, so nothing of the
+                 // phone's own is changed by reading it here.
+                 let renewed = self
+-                    .upgrade(key_blob, |call| Self::gcm_params(call, app_id, nonce))
++                    .upgrade(key_blob, |call| Self::binding_params(call, app_id))
+                     .context("renew the key for the firmware running now")?;
+                 self.begin(&renewed, app_id, nonce, note)?
+             }
+@@ -241,8 +252,13 @@ impl<'a> KeyMint<'a> {
+     /// with, and a binding to nothing named is not the same to it as none
+     /// named at all, so naming an empty one leaves it unable to unwrap a
+     /// key that was made bound to nothing.
++    fn binding_params(call: &mut Parcel, app_id: &[u8]) {
++        call.i32(i32::from(!app_id.is_empty()));
++        if !app_id.is_empty() { parameter(call, TAG_APPLICATION_ID, Value::Blob(app_id)); }
++    }
++
+     fn gcm_params(call: &mut Parcel, app_id: &[u8], nonce: &[u8]) {
+-        call.i32(if app_id.is_empty() { 5 } else { 6 });
++        call.i32(if app_id.is_empty() { 4 } else { 5 });
+         parameter(call, TAG_BLOCK_MODE, Value::Enum(VALUE_BLOCK_MODE, BLOCK_MODE_GCM));
+         parameter(call, TAG_PADDING, Value::Enum(VALUE_PADDING_MODE, PADDING_NONE));
+         parameter(call, TAG_MAC_LENGTH, Value::Integer(128));
+@@ -250,7 +266,6 @@ impl<'a> KeyMint<'a> {
+             parameter(call, TAG_APPLICATION_ID, Value::Blob(app_id));
+         }
+         parameter(call, TAG_NONCE, Value::Blob(nonce));
+-        parameter(call, TAG_PURPOSE, Value::Enum(VALUE_KEY_PURPOSE, PURPOSE_DECRYPT));
+     }
+ 
+     /// Open a decryption with the key service and keep hold of it.
 diff --git a/crates/skyward-crypto/src/lib.rs b/crates/skyward-crypto/src/lib.rs
 index 9a6b46f..23c6ba2 100644
 --- a/crates/skyward-crypto/src/lib.rs
@@ -648,10 +784,10 @@ index 6f5dc71..6d96f9a 100644
          cpu: cpu(Path::new(CPU))?,
          ram_kib: mem_total(&read("/proc/meminfo")?)?,
 diff --git a/crates/skyward-install/Cargo.toml b/crates/skyward-install/Cargo.toml
-index 437d7dd..e2257e8 100644
+index 437d7dd..b09d2af 100644
 --- a/crates/skyward-install/Cargo.toml
 +++ b/crates/skyward-install/Cargo.toml
-@@ -17,6 +17,7 @@ polyfuse-kernel = "0.2.0"
+@@ -17,17 +17,18 @@ polyfuse-kernel = "0.2.0"
  rsa = "0.9.10"
  sha1 = { version = "0.10.7", features = ["oid"] }
  sha2 = { version = "0.10.9", features = ["oid"] }
@@ -659,7 +795,13 @@ index 437d7dd..e2257e8 100644
  skyward-block = { path = "../skyward-block" }
  skyward-config = { path = "../skyward-config" }
  skyward-info = { path = "../skyward-info" }
-@@ -29,5 +30,4 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
+ skyward-sys = { path = "../skyward-sys" }
+ skyward-systems = { path = "../skyward-systems" }
+ skyward-vab = { path = "../skyward-vab" }
++tar = "0.4.46"
+ x509-cert = "0.2.5"
+ zerocopy = { version = "0.8.63", features = ["derive"] }
+ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
  zstd = { version = "0.14.3", default-features = false }
  
  [dev-dependencies]
@@ -865,15 +1007,196 @@ index 0000000..02616d6
 +        assert!(backup(b"original boot", dir.path(), "../boot").is_err());
 +    }
 +}
+diff --git a/crates/skyward-install/src/browser.rs b/crates/skyward-install/src/browser.rs
+new file mode 100644
+index 0000000..19a5ed2
+--- /dev/null
++++ b/crates/skyward-install/src/browser.rs
+@@ -0,0 +1,174 @@
++//! Install the verified WPE component into a fresh directory, then publish it.
++use anyhow::{Context, Result, ensure};
++use flate2::read::GzDecoder;
++use std::fs::{self, File};
++use std::io::{self, Read};
++use std::os::unix::fs::PermissionsExt;
++use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++const LIMIT: u64 = 1024 * 1024 * 1024;
++const PROGRAM: &str = "opt/wpe/browser";
++
++/// Public runtime resources must remain readable after the launcher drops uid.
++/// Cache and output directories keep the engine's own permissions.
++pub fn prepare(root: &Path) -> Result<()> {
++    fn resources(path: &Path) -> Result<()> {
++        let metadata=fs::symlink_metadata(path)?;
++        if metadata.is_dir() {
++            fs::set_permissions(path,fs::Permissions::from_mode((metadata.permissions().mode() & 0o777) | 0o755))?;
++            for entry in fs::read_dir(path)? {resources(&entry?.path())?;}
++        } else if metadata.is_file() {
++            fs::set_permissions(path,fs::Permissions::from_mode((metadata.permissions().mode() & 0o777) | 0o644))?;
++        }
++        Ok(())
++    }
++    fs::set_permissions(root,fs::Permissions::from_mode(0o755))?;
++    for name in ["opt","usr","etc"] {
++        let path=root.join(name);
++        if path.exists() {resources(&path)?;}
++    }
++    Ok(())
++}
++
++struct Cancellable<'a, R> { input: R, stop: &'a AtomicBool }
++impl<R: Read> Read for Cancellable<'_, R> {
++    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
++        if self.stop.load(Ordering::Relaxed) { return Err(io::Error::other("浏览器组件安装已取消")); }
++        self.input.read(bytes)
++    }
++}
++
++/// The caller authenticates the ZIP's SHA-256 before calling this function.
++/// Only runtime.tar.gz is read; no program from the ZIP is executed.
++pub fn install(package: &Path, base: &Path, stop: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<()> {
++    fs::create_dir_all(base).context("创建浏览器组件目录")?;
++    let (root, staging, previous) = (base.join("root"), base.join("root.installing"), base.join("root.previous"));
++    if previous.exists() && !root.exists() { fs::rename(&previous, &root).context("恢复浏览器组件")?; }
++    if staging.exists() { fs::remove_dir_all(&staging).context("清理未完成的组件安装")?; }
++    fs::create_dir(&staging)?;
++    // Recovery's umask is 077. The engine runs as nobody after chroot,
++    // and tar's '.' entry leaves this pre-created directory untouched.
++    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))?;
++    let installed = (|| -> Result<()> {
++        let mut zip = zip::ZipArchive::new(File::open(package)?).context("打开浏览器组件包")?;
++        let packed = zip.by_name("runtime.tar.gz").context("组件包缺少 runtime.tar.gz")?;
++        let input = Cancellable { input: GzDecoder::new(packed), stop };
++        let mut archive = tar::Archive::new(input);
++        let mut unpacked = 0u64;
++        for entry in archive.entries().context("读取浏览器组件归档")? {
++            let mut entry = entry.context("读取浏览器组件文件")?;
++            let kind = entry.header().entry_type();
++            ensure!(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link(), "浏览器组件包含不支持的文件类型");
++            if kind.is_file() {
++                let size = entry.size();
++                unpacked = unpacked.checked_add(size).filter(|n| *n <= LIMIT).context("浏览器组件解包大小超出限制")?;
++                let free = skyward_block::mount::space(&staging)?.available;
++                ensure!(size <= free, "空间不足：需要 {} MiB，可用 {} MiB", size.div_ceil(1024 * 1024), free / (1024 * 1024));
++            }
++            ensure!(entry.unpack_in(&staging).context("解包浏览器组件文件")?, "浏览器组件包含无效路径");
++            progress(unpacked);
++        }
++        // Read through gzip's trailer so truncated streams cannot be published.
++        io::copy(&mut archive.into_inner(), &mut io::sink()).context("检查浏览器组件归档结尾")?;
++        prepare(&staging).context("设置浏览器组件文件权限")?;
++        fs::set_permissions(staging.join(PROGRAM),fs::Permissions::from_mode(0o755))?;
++        let mut header = [0u8; 20];
++        File::open(staging.join(PROGRAM)).context("组件包缺少浏览器程序")?.read_exact(&mut header)?;
++        ensure!(&header[..6] == b"\x7fELF\x02\x01" && u16::from_le_bytes([header[18],header[19]]) == 183, "浏览器组件不是 ARM64 程序");
++        ensure!(!stop.load(Ordering::Relaxed), "浏览器组件安装已取消");
++        if previous.exists() { fs::remove_dir_all(&previous)?; }
++        if root.exists() { fs::rename(&root, &previous).context("保留现有浏览器组件")?; }
++        if let Err(error) = fs::rename(&staging, &root) {
++            if previous.exists() { let _ = fs::rename(&previous, &root); }
++            return Err(error).context("启用浏览器组件");
++        }
++        Ok(())
++    })();
++    if installed.is_err() { let _ = fs::remove_dir_all(&staging); }
++    else if previous.exists() { let _ = fs::remove_dir_all(&previous); }
++    installed
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use flate2::{Compression, write::GzEncoder};
++    use std::io::{Cursor, Write};
++    use std::os::unix::process::CommandExt;
++    use zip::write::SimpleFileOptions;
++
++    fn package(path: &Path, valid: bool) {
++        let gzip = GzEncoder::new(Vec::new(), Compression::fast());
++        let mut tar = tar::Builder::new(gzip);
++        let mut elf = vec![0;64]; elf[..6].copy_from_slice(b"\x7fELF\x02\x01"); elf[18]=183;
++        let mut header=tar::Header::new_gnu(); header.set_mode(0o755); header.set_size(elf.len() as u64); header.set_cksum();
++        tar.append_data(&mut header, if valid {PROGRAM} else {"opt/wpe/other"}, Cursor::new(elf)).unwrap();
++        let mut header=tar::Header::new_gnu();header.set_mode(0);header.set_size(4);header.set_cksum();
++        tar.append_data(&mut header,"opt/wpe/start.html",Cursor::new(b"page")).unwrap();
++        let mut zip=zip::ZipWriter::new(File::create(path).unwrap());
++        zip.start_file("runtime.tar.gz",SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
++        zip.write_all(&tar.into_inner().unwrap().finish().unwrap()).unwrap(); zip.finish().unwrap();
++    }
++
++    #[test]
++    fn component_is_published_only_when_complete() {
++        let dir=tempfile::tempdir().unwrap(); let zip=dir.path().join("runtime.zip"); let base=dir.path().join("browser");
++        fs::create_dir_all(base.join("root")).unwrap(); fs::write(base.join("root/old"),b"old runtime").unwrap();
++        package(&zip,false);
++        assert!(install(&zip,&base,&AtomicBool::new(false),&mut |_|{}).is_err());
++        assert!(base.join("root/old").is_file()); assert!(!base.join("root.installing").exists());
++        package(&zip,true); install(&zip,&base,&AtomicBool::new(false),&mut |_|{}).unwrap();
++        assert!(base.join("root").join(PROGRAM).is_file()); assert!(!base.join("root/old").exists());
++        assert_eq!(fs::metadata(base.join("root")).unwrap().permissions().mode() & 0o777,0o755);
++        assert_eq!(fs::metadata(base.join("root").join(PROGRAM)).unwrap().permissions().mode() & 0o777,0o755);
++        assert_eq!(fs::metadata(base.join("root/opt/wpe/start.html")).unwrap().permissions().mode() & 0o777,0o644);
++        assert!(!base.join("root.previous").exists());
++    }
++
++    #[test]
++    fn cancellation_leaves_the_existing_component_available() {
++        let dir=tempfile::tempdir().unwrap(); let zip=dir.path().join("runtime.zip"); let base=dir.path().join("browser");
++        fs::create_dir_all(base.join("root")).unwrap(); fs::write(base.join("root/old"),b"old runtime").unwrap();
++        package(&zip,true);
++        assert!(install(&zip,&base,&AtomicBool::new(true),&mut |_|{}).is_err());
++        assert_eq!(fs::read(base.join("root/old")).unwrap(),b"old runtime");
++        assert!(!base.join("root.installing").exists());
++    }
++
++    #[test]
++    fn recovery_umask_keeps_the_chroot_accessible_to_the_browser() {
++        const CHILD: &str = "SKYWARD_BROWSER_UMASK_TEST";
++        if std::env::var_os(CHILD).is_some() {
++            let dir=tempfile::tempdir().unwrap(); let zip=dir.path().join("runtime.zip"); let base=dir.path().join("browser");
++            package(&zip,true);
++            install(&zip,&base,&AtomicBool::new(false),&mut |_|{}).unwrap();
++            assert_eq!(fs::metadata(base.join("root")).unwrap().permissions().mode() & 0o777,0o755);
++            return;
++        }
++        let mut command=std::process::Command::new(std::env::current_exe().unwrap());
++        command.args(["--exact","browser::tests::recovery_umask_keeps_the_chroot_accessible_to_the_browser","--test-threads=1"]).env(CHILD,"1");
++        unsafe { command.pre_exec(|| {libc::umask(0o077);Ok(())}); }
++        let result=command.output().unwrap();
++        assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
++    }
++
++    #[test]
++    fn unreadable_resources_are_repaired_while_cache_stays_private() {
++        let dir=tempfile::tempdir().unwrap();let root=dir.path();
++        fs::create_dir_all(root.join("opt/wpe")).unwrap();fs::create_dir_all(root.join("tmp/home")).unwrap();
++        let page=root.join("opt/wpe/start.html");let private=root.join("tmp/home/private");
++        for path in [&page,&private] {fs::write(path,b"fixture").unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0)).unwrap();}
++        prepare(root).unwrap();
++        assert_eq!(fs::metadata(page).unwrap().permissions().mode() & 0o777,0o644);
++        assert_eq!(fs::metadata(private).unwrap().permissions().mode() & 0o777,0);
++    }
++
++    #[test]
++    fn published_runtime_package_can_be_installed() {
++        let Some(package)=std::env::var_os("SKYWARD_BROWSER_TEST_PACKAGE") else {return};
++        let dir=tempfile::tempdir().unwrap();
++        install(Path::new(&package),dir.path(),&AtomicBool::new(false),&mut |_|{}).unwrap();
++        assert!(dir.path().join("root").join(PROGRAM).is_file());
++    }
++}
 diff --git a/crates/skyward-install/src/lib.rs b/crates/skyward-install/src/lib.rs
-index 213f214..76eec16 100644
+index 213f214..3a3ce13 100644
 --- a/crates/skyward-install/src/lib.rs
 +++ b/crates/skyward-install/src/lib.rs
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,8 @@
  pub mod adb;
  pub mod asked;
  pub mod blockmap;
 +pub mod boot;
++pub mod browser;
  pub mod commands;
  pub mod fuse;
  pub mod image;
@@ -1013,6 +1336,77 @@ index 8db3516..c05cd93 100644
      use hickory_proto::rr::rdata::{A, CNAME};
      use hickory_proto::rr::Record;
  
+diff --git a/crates/skyward-net/src/github.rs b/crates/skyward-net/src/github.rs
+index ff45a89..a0b7b37 100644
+--- a/crates/skyward-net/src/github.rs
++++ b/crates/skyward-net/src/github.rs
+@@ -7,6 +7,10 @@ use serde::Deserialize;
+ /// Where GitHub answers which release of Skyward is the newest.
+ pub const LATEST: &str = "https://api.github.com/repos/kirklin/skyward/releases/latest";
+ 
++/// The nabu port's optional WPE runtime, published with its device releases.
++pub const BROWSER_LATEST: &str = "https://api.github.com/repos/SeimoDev/android_device_xiaomi_nabu_skyward/releases/latest";
++pub const BROWSER_RUNTIME: &str = "skyward-browser-runtime.zip";
++
+ /// The version of GitHub's API the answer is read as.
+ const API_VERSION: &str = "2022-11-28";
+ 
+@@ -69,6 +73,32 @@ struct Message {
+     message: String,
+ }
+ 
++/// Select the browser component by its full asset name and require GitHub's
++/// upload digest before allowing it to be installed.
++pub fn browser_asset(answer: &str) -> Result<Build> {
++    let release: Release = serde_json::from_str(answer).context("read GitHub's browser release")?;
++    let asset = release.assets.into_iter().find(|a| a.name == BROWSER_RUNTIME)
++        .context("此 GitHub Release 没有浏览器组件包")?;
++    let sha256 = asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:"))
++        .context("GitHub 未提供浏览器组件的 SHA-256")?;
++    ensure!(sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()), "浏览器组件的 SHA-256 无效");
++    ensure!((1..=512 * 1024 * 1024).contains(&asset.size), "浏览器组件大小无效");
++    ensure!(asset.url.starts_with("https://api.github.com/") && asset.browser_download_url.starts_with("https://github.com/SeimoDev/android_device_xiaomi_nabu_skyward/releases/download/"), "浏览器组件下载地址无效");
++    Ok(Build { name: asset.name, url: asset.url, link: asset.browser_download_url, size: asset.size, sha256: sha256.to_lowercase() })
++}
++
++pub fn browser_runtime(agent: &ureq::Agent, running: &str) -> Result<Build> {
++    let mut response = agent.get(BROWSER_LATEST)
++        .header("Accept", "application/vnd.github+json")
++        .header("X-GitHub-Api-Version", API_VERSION)
++        .header("User-Agent", format!("Skyward/{running}"))
++        .call().context("连接 GitHub 获取浏览器组件")?;
++    let status = response.status();
++    let body = response.body_mut().read_to_string().context("读取浏览器组件信息")?;
++    ensure!(status.is_success(), "{}", refusal(status, &body));
++    browser_asset(&body)
++}
++
+ /// The newest release that `answer`, GitHub's answer at [`LATEST`], tells
+ /// of, and its zip for the phone `codename` names, as the build of version
+ /// `running` sees it.
+@@ -147,6 +177,22 @@ fn refusal(status: ureq::http::StatusCode, body: &str) -> String {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn browser_runtime_requires_the_exact_asset_and_a_digest() {
++        let asset = serde_json::json!({"name":BROWSER_RUNTIME,"size":191199738,
++            "url":"https://api.github.com/repos/SeimoDev/android_device_xiaomi_nabu_skyward/releases/assets/123",
++            "browser_download_url":"https://github.com/SeimoDev/android_device_xiaomi_nabu_skyward/releases/download/v0.3.1-nabu.3/skyward-browser-runtime.zip",
++            "digest":format!("sha256:{}", "A".repeat(64))});
++        let answer = |asset| serde_json::json!({"tag_name":"v0.3.1-nabu.3", "assets":[asset]}).to_string();
++        assert_eq!(browser_asset(&answer(asset.clone())).unwrap().sha256, "a".repeat(64));
++        for (field,value) in [("name",serde_json::json!("skyward-nabu-boot-installer.zip")),
++            ("digest",serde_json::Value::Null),("size",serde_json::json!(0)),
++            ("browser_download_url",serde_json::json!("http://example.com/runtime.zip"))] {
++            let mut invalid=asset.clone(); invalid[field]=value;
++            assert!(browser_asset(&answer(invalid)).is_err(), "{field}");
++        }
++    }
++
+     /// What GitHub answered of the newest release on 2026-11-07, with the
+     /// parts that do not matter here left out.
+     const ANSWERED_013: &str = r#"{"url":"https://api.github.com/repos/kirklin/skyward/releases/437365758","tag_name":"v0.1.3","name":"v0.1.3","draft":false,"prerelease":false,"assets":[{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751468","id":719751468,"name":"SHA256SUMS","label":"","content_type":"application/octet-stream","state":"uploaded","size":2337,"digest":"sha256:052f9ca757baeb2eac78c8e546bcc54178f6bb9bf9e5bde53fa81b3f48448957","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/SHA256SUMS"},{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751598","id":719751598,"name":"skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip","label":"Xiaomi 13 Ultra (ishtar)","content_type":"application/zip","state":"uploaded","size":42739608,"digest":"sha256:62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip"},{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751747","id":719751747,"name":"skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.zip","label":"Xiaomi 17 Ultra (nezha)","content_type":"application/zip","state":"uploaded","size":43145196,"digest":"sha256:9f6165079529418d8f6635beddfdd9abf9a70c89d69eb467a9922b0db69bfaf1","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.zip"}]}"#;
 diff --git a/crates/skyward-net/src/http.rs b/crates/skyward-net/src/http.rs
 index a5b8d6b..225c19b 100644
 --- a/crates/skyward-net/src/http.rs
@@ -1575,7 +1969,7 @@ index a4b9a90..9cccd8b 100644
          Cmd::Stock { config, out } => {
              let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
 diff --git a/crates/skyward-preview/src/main.rs b/crates/skyward-preview/src/main.rs
-index d47b9f7..d7acc07 100644
+index d47b9f7..72290d9 100644
 --- a/crates/skyward-preview/src/main.rs
 +++ b/crates/skyward-preview/src/main.rs
 @@ -143,7 +143,10 @@ fn main() -> Result<()> {
@@ -1590,10 +1984,25 @@ index d47b9f7..d7acc07 100644
      let (w, h) = (cfg.display.width, cfg.display.height);
      let ppd = cfg.display.density as f32 / 160.0;
      let light = Theme::light(w, h, ppd);
-@@ -163,6 +166,21 @@ fn main() -> Result<()> {
+@@ -163,6 +166,36 @@ fn main() -> Result<()> {
      }
  
      let info = nezha(&cfg);
++    if args.iter().any(|a| a=="--browser-only") {
++        for dark in [false,true] {
++            for failed in [false,true] {
++                let mut app=opened(Screen::Browser,w,h,ppd);
++                app.state.dark=dark;
++                if failed {app.state.browser.error=Some("下载中断，请检查 Wi-Fi、代理或 DNS 后重试".into());}
++                else {app.state.browser.install=Some(skyward_ui::app::BrowserInstall::Transfer(skyward_net::download::Progress::Downloading{done:95_599_869,total:191_199_738}));}
++                app.frame(&fonts,&info);app.tick(0);app.tick(2000);
++                let mut canvas=Canvas::new(w,h);
++                app.compose(&mut canvas,&fonts,&info,CLOCK,2000);
++                write_png(&out.join(format!("browser-{}-{}.png",if failed {"error"} else {"download"},if dark {"dark"} else {"light"})),&canvas)?;
++            }
++        }
++        return Ok(());
++    }
 +    if args.iter().any(|a| a == "--about-only" || a == "--install-only") {
 +        for dark in [false, true] {
 +            let screen = if args.iter().any(|a| a == "--install-only") { Screen::Install } else { Screen::About };
@@ -1612,7 +2021,7 @@ index d47b9f7..d7acc07 100644
      let pending = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info.clone() };
      let pattern = Data::Locked { user: 0, keys: Keys::Pattern, checking: false };
      // Whole pages, the way a long screenshot shows them. The About page's
-@@ -1534,8 +1552,9 @@ fn whole_page(app: &mut App, f: &Fonts, info: &DeviceInfo) -> Canvas {
+@@ -1534,8 +1567,9 @@ fn whole_page(app: &mut App, f: &Fonts, info: &DeviceInfo) -> Canvas {
  /// config supplies the SoC name, panel and screen size).
  fn nezha(cfg: &DeviceConfig) -> DeviceInfo {
      DeviceInfo {
@@ -1661,7 +2070,7 @@ index ad4a541..414872d 100644
          assert_eq!(on("vendor/bin/sh"), None, "a path from nowhere is on none");
      }
 diff --git a/crates/skyward-programs/src/secure.rs b/crates/skyward-programs/src/secure.rs
-index 33d73a5..b16c14f 100644
+index 33d73a5..3ad7307 100644
 --- a/crates/skyward-programs/src/secure.rs
 +++ b/crates/skyward-programs/src/secure.rs
 @@ -13,6 +13,8 @@ use std::path::Path;
@@ -1673,7 +2082,7 @@ index 33d73a5..b16c14f 100644
  const KEY_PACKAGES: [&str; 3] = ["android.hardware.security.keymint", "android.hardware.security.secureclock", "android.hardware.security.sharedsecret"];
  
  /// The credential service and the boot control, each by its package and
-@@ -161,20 +163,33 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
+@@ -161,27 +163,40 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
          }
      }
  
@@ -1718,6 +2127,14 @@ index 33d73a5..b16c14f 100644
      }
      let ready = |name: String, kind: Kind| match kind {
          Kind::Aidl => Ready::Service(name),
+         Kind::Hidl => Ready::HardwareService(name),
+     };
+     let alone = |_: &Described| false;
+-    let program = behind(phone, "the credential service", &credentials, |file| file.contains("gatekeeper"))?;
++    let program = behind(phone, "the credential service", &credentials, |file| file.contains("gatekeeper") && file != "gatekeeperd")?;
+     let registers = besides(phone, program, &credentials, alone);
+     start(&mut out, started(phone, program, ready(credentials, credentials_kind), registers));
+ 
 @@ -195,6 +210,13 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
      Ok(out)
  }
@@ -1734,10 +2151,10 @@ index 33d73a5..b16c14f 100644
  /// tells of what that program registers and of nothing else. One named
 diff --git a/crates/skyward-programs/tests/nabu.rs b/crates/skyward-programs/tests/nabu.rs
 new file mode 100644
-index 0000000..ad9bddd
+index 0000000..a6f6261
 --- /dev/null
 +++ b/crates/skyward-programs/tests/nabu.rs
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,74 @@
 +use skyward_programs::description::Kind;
 +use skyward_programs::phone::{Partition, Phone, PARTITIONS};
 +use skyward_programs::secure::{self, KEYMASTER_COMPAT};
@@ -1783,6 +2200,34 @@ index 0000000..ad9bddd
 +    assert_eq!(partition.at, root.path().join("system"));
 +    assert_eq!(partition.mounted, partition.at);
 +    assert_eq!(Partition::mounted("vendor", root.path()).at, root.path());
++}
++
++#[test]
++fn nabu_uses_hardware_gatekeeper_when_gatekeeperd_is_also_installed() {
++    fn copy_tree(from: &Path, to: &Path) {
++        std::fs::create_dir_all(to).unwrap();
++        for entry in std::fs::read_dir(from).unwrap() {
++            let entry = entry.unwrap();
++            let dest = to.join(entry.file_name());
++            if entry.file_type().unwrap().is_dir() { copy_tree(&entry.path(), &dest); }
++            else { std::fs::copy(entry.path(), &dest).unwrap(); std::fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap(); }
++        }
++    }
++    let root = tempfile::tempdir().unwrap();
++    copy_tree(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/nabu"), root.path());
++    std::fs::write(root.path().join("system/system/bin/gatekeeperd"), b"fixture").unwrap();
++    std::fs::write(root.path().join("system/system/etc/init/gatekeeperd.rc"),
++        "service gatekeeperd /system/bin/gatekeeperd /data/misc/gatekeeper\n    class late_start\n    user system\n").unwrap();
++    let partitions = PARTITIONS.iter().map(|name| Partition {
++        name: name.to_string(),
++        mounted: if *name == "system" { "/mnt/system/system".into() } else { format!("/{name}").into() },
++        at: if *name == "system" { root.path().join("system/system") } else { root.path().join(name) },
++    }).collect();
++    let phone = Phone::read(partitions, HashMap::new(), None).unwrap();
++    let steps = secure::steps(&phone).unwrap();
++    let programs = secure::programs(&steps);
++    assert!(programs.iter().any(|p| p.service.path == "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"));
++    assert!(!programs.iter().any(|p| p.service.path.ends_with("/gatekeeperd")));
 +}
 diff --git a/crates/skyward-programs/tests/nabu/system/system/bin/hwservicemanager b/crates/skyward-programs/tests/nabu/system/system/bin/hwservicemanager
 new file mode 100644
@@ -2468,10 +2913,10 @@ index 5bd3aee..82f77cd 100644
          cpu: Cpu { cores: 8, max_khz: Some(3_187_200) },
          ram_kib: 15_556_972,
 diff --git a/crates/skyward-ui/src/app/act.rs b/crates/skyward-ui/src/app/act.rs
-index 1033f0c..754d0d5 100644
+index 1033f0c..c5b90ef 100644
 --- a/crates/skyward-ui/src/app/act.rs
 +++ b/crates/skyward-ui/src/app/act.rs
-@@ -21,6 +21,27 @@ impl App {
+@@ -21,6 +21,28 @@ impl App {
                  }
                  return self.arrive_at(s);
              }
@@ -2480,6 +2925,7 @@ index 1033f0c..754d0d5 100644
 +            Action::BrowserBack => return vec![Effect::Browser(BrowserCommand::Back)],
 +            Action::BrowserForward => return vec![Effect::Browser(BrowserCommand::Forward)],
 +            Action::BrowserReload => return vec![Effect::Browser(BrowserCommand::Reload)],
++            Action::BrowserCancelInstall => return vec![Effect::Browser(BrowserCommand::CancelInstall)],
 +            Action::BrowserKeyboard => return vec![Effect::Browser(BrowserCommand::Focus)],
 +            Action::BrowserDownloads => {
 +                self.state.files.path = "/sdcard/Download/Skyward".into();
@@ -2499,7 +2945,7 @@ index 1033f0c..754d0d5 100644
              Action::OpenData => return self.open_data(),
              Action::Skip => {
                  self.leave(true);
-@@ -478,6 +499,13 @@ impl App {
+@@ -478,6 +500,13 @@ impl App {
                  self.state.adding.as_mut().expect("the protections open on the page that adds a network").choosing = false;
                  self.refresh();
              }
@@ -2513,7 +2959,7 @@ index 1033f0c..754d0d5 100644
              // Asking takes a network, which the WLAN page joins.
              Action::CheckUpdate => {
                  if !self.state.online() {
-@@ -573,6 +601,8 @@ impl App {
+@@ -573,6 +602,8 @@ impl App {
              Screen::Decrypt => &mut self.state.code,
              Screen::Rename => &mut self.state.new_name,
              Screen::WlanPassword => &mut self.state.password,
@@ -2522,7 +2968,7 @@ index 1033f0c..754d0d5 100644
              Screen::WlanAdd => {
                  let a = self.state.adding.as_mut().expect("the page adds a network");
                  match a.field {
-@@ -610,6 +640,8 @@ impl App {
+@@ -610,6 +641,8 @@ impl App {
              }
              Cap::Show(layer) => self.state.layer = layer,
              Cap::Enter => match self.screen() {
@@ -2533,10 +2979,10 @@ index 1033f0c..754d0d5 100644
                          return self.act(Action::Open(first.screen), now);
 diff --git a/crates/skyward-ui/src/app/browser.rs b/crates/skyward-ui/src/app/browser.rs
 new file mode 100644
-index 0000000..c774103
+index 0000000..a724ab6
 --- /dev/null
 +++ b/crates/skyward-ui/src/app/browser.rs
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,132 @@
 +//! Browser navigation, text entry and the webpage's native input bridge.
 +use super::*;
 +use serde::Serialize;
@@ -2545,10 +2991,18 @@ index 0000000..c774103
 +#[derive(Clone, Debug, PartialEq, Serialize)]
 +#[serde(tag = "cmd", rename_all = "snake_case")]
 +pub enum BrowserCommand {
-+    Open, Close, Back, Forward, Reload, Focus,
++    Open, Close, Back, Forward, Reload, Focus, CancelInstall,
 +    Navigate { url: String },
 +    Text { text: String },
 +    Touch { phase: u8, x: f32, y: f32 },
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BrowserInstall {
++    Locating,
++    Transfer(Progress),
++    Extracting { bytes: u64 },
++    Cancelling,
 +}
 +
 +#[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2566,6 +3020,7 @@ index 0000000..c774103
 +    pub url: String, pub title: String, pub error: Option<String>,
 +    pub back: bool, pub forward: bool, pub download: String,
 +    pub frame: Option<Arc<BrowserPixels>>,
++    pub install: Option<BrowserInstall>,
 +    pub edit: BrowserEdit, pub input: String,
 +    finger: Option<(f32, f32)>,
 +}
@@ -2616,6 +3071,7 @@ index 0000000..c774103
 +    }
 +    pub(super) fn browser_touch(&mut self, ev: Touch) -> Option<Vec<Effect>> {
 +        if self.screen() != Screen::Browser { return None; }
++        if self.state.browser.install.is_some() { return None; }
 +        if self.state.browser.error.is_some() { return None; }
 +        let rect = browser_viewport(&self.theme());
 +        let size = self.state.browser.frame.as_ref().map(|p| (p.w as f32, p.h as f32));
@@ -2637,6 +3093,16 @@ index 0000000..c774103
 +        assert_eq!(browser_url(" example.com/a?b=1 ").as_deref(), Some("https://example.com/a?b=1"));
 +        assert_eq!(browser_url("http://192.0.2.1/").as_deref(), Some("http://192.0.2.1/"));
 +        for url in ["", "file:///etc/passwd", "javascript:alert(1)", "data:text/html,hi", "https://", "two words"] { assert_eq!(browser_url(url), None); }
++    }
++    #[test] fn installation_keeps_its_page_until_it_can_be_left_safely() {
++        let mut app=App::new(Screen::Home,1600,2560,2.25);
++        app.open(Screen::Browser);
++        app.state.browser.install=Some(BrowserInstall::Locating);
++        assert!(app.back(1).is_empty());
++        assert_eq!(app.screen(),Screen::Browser);
++        app.state.browser.install=None;
++        assert_eq!(app.back(2),vec![Effect::Browser(BrowserCommand::Close)]);
++        assert_eq!(app.screen(),Screen::Home);
 +    }
 +    #[test] fn webpage_drag_keeps_its_coordinates_through_release() {
 +        let mut app=App::new(Screen::Browser,1600,2560,2.25);
@@ -2687,7 +3153,7 @@ index ffb4f84..554c512 100644
      fn leaving_while_waiting_cancels_and_the_end_clears_it() {
          let (f, i) = (fonts(), info());
 diff --git a/crates/skyward-ui/src/app/mod.rs b/crates/skyward-ui/src/app/mod.rs
-index c05e99f..a212de6 100644
+index c05e99f..c70eddb 100644
 --- a/crates/skyward-ui/src/app/mod.rs
 +++ b/crates/skyward-ui/src/app/mod.rs
 @@ -35,6 +35,7 @@ use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
@@ -2735,7 +3201,7 @@ index c05e99f..a212de6 100644
  }
  
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-@@ -229,6 +239,13 @@ pub enum Confirm {
+@@ -229,6 +239,14 @@ pub enum Confirm {
  #[derive(Clone, Copy, Debug, PartialEq)]
  pub enum Action {
      Open(Screen),
@@ -2746,10 +3212,11 @@ index c05e99f..a212de6 100644
 +    BrowserReload,
 +    BrowserKeyboard,
 +    BrowserDownloads,
++    BrowserCancelInstall,
      /// Leave the decrypt page for the page it was opened from; the page
      /// the recovery started on, for the home page without keeping it
      /// behind.
-@@ -325,6 +342,8 @@ pub enum Action {
+@@ -325,6 +343,8 @@ pub enum Action {
      EditEntry,
      /// Install the file the file page shows.
      InstallEntry,
@@ -2758,7 +3225,7 @@ index c05e99f..a212de6 100644
      /// Write the file the editor page shows as it now stands.
      SaveText,
      /// Open the page of the permissions of the entry the file page shows.
-@@ -367,6 +386,10 @@ pub enum Action {
+@@ -367,6 +387,10 @@ pub enum Action {
      PickSecurity(Security),
      /// Close the list open over the page, choosing nothing.
      CloseChoices,
@@ -2769,7 +3236,7 @@ index c05e99f..a212de6 100644
      /// Ask the update server for the newest system.
      CheckUpdate,
      /// Download the newest system's full package, or carry on downloading
-@@ -415,6 +438,7 @@ pub enum Shot {
+@@ -415,6 +439,7 @@ pub enum Shot {
  /// Work the runtime carries out on the UI's behalf.
  #[derive(Clone, Debug, PartialEq)]
  pub enum Effect {
@@ -2777,7 +3244,7 @@ index c05e99f..a212de6 100644
      Reboot(Target),
      /// A short tap of the vibration motor.
      Haptic,
-@@ -571,6 +595,7 @@ pub enum Effect {
+@@ -571,6 +596,7 @@ pub enum Effect {
      ScanWlan,
      JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
      LeaveWlan,
@@ -2786,14 +3253,18 @@ index c05e99f..a212de6 100644
      /// answered with [`App::update_checked`].
      CheckUpdate,
 diff --git a/crates/skyward-ui/src/app/nav.rs b/crates/skyward-ui/src/app/nav.rs
-index 94a7f80..7720831 100644
+index 94a7f80..4b186d1 100644
 --- a/crates/skyward-ui/src/app/nav.rs
 +++ b/crates/skyward-ui/src/app/nav.rs
-@@ -89,6 +89,13 @@ impl App {
+@@ -89,6 +89,17 @@ impl App {
          }
          let left = self.screen();
          match left {
 +            Screen::Browser => {
++                if self.state.browser.install.is_some() {
++                    self.say(l.pick(["请等待组件安装完成，或先取消安装", "請等待元件安裝完成，或先取消安裝", "Wait for installation to finish, or cancel it first"]), now);
++                    return fx;
++                }
 +                self.state.browser.running = false;
 +                self.state.browser.frame = None;
 +                self.state.browser.input.clear();
@@ -2803,7 +3274,7 @@ index 94a7f80..7720831 100644
              Screen::Mount => self.state.mount_failure = None,
              // A slot picked and not switched to is put down.
              Screen::Slot => self.state.next_slot = None,
-@@ -138,6 +145,13 @@ impl App {
+@@ -138,6 +149,13 @@ impl App {
                  self.state.password.clear();
              }
              Screen::WlanNetwork => self.state.details = None,
@@ -2817,7 +3288,7 @@ index 94a7f80..7720831 100644
              // A list open over the page closes first.
              Screen::WlanAdd => {
                  if let Some(a) = self.state.adding.as_mut().filter(|a| a.choosing) {
-@@ -284,6 +298,15 @@ impl App {
+@@ -284,6 +302,15 @@ impl App {
      /// how it learns which control a user's screen lock is answered with.
      pub(super) fn arrive_at(&mut self, s: Screen) -> Vec<Effect> {
          match s {
@@ -3314,17 +3785,44 @@ index 1951193..c5bc311 100644
 +mod browser;
 diff --git a/crates/skyward-ui/src/pages/browser.rs b/crates/skyward-ui/src/pages/browser.rs
 new file mode 100644
-index 0000000..eee8ac2
+index 0000000..d8c805e
 --- /dev/null
 +++ b/crates/skyward-ui/src/pages/browser.rs
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,72 @@
 +use super::*;
-+use crate::app::{browser_viewport, BrowserEdit};
++use crate::app::{browser_viewport, BrowserEdit, BrowserInstall};
 +pub(super) const TITLE: Text = ["浏览器", "瀏覽器", "Browser"];
 +
 +pub(super) fn page(cx: &Ctx) -> Frame {
 +    let (t,f,s,l)=(cx.t,cx.f,&cx.state.browser,cx.state.lang);
 +    let mut c=super::page(cx);
++    if let Some(stage)=s.install {
++        let (title,detail,share)=match stage {
++            BrowserInstall::Locating => (l.pick(["正在获取浏览器组件", "正在取得瀏覽器元件", "Finding browser component"]), l.pick(["连接 GitHub…", "連線 GitHub…", "Connecting to GitHub…"]).to_owned(), None),
++            BrowserInstall::Transfer(progress) => {
++                let (title,detail,share)=super::downloaded(l,progress,0);
++                let detail=detail.split(" · ").next().unwrap_or(&detail).to_owned();
++                (title,detail,share)
++            }
++            BrowserInstall::Extracting {bytes} => (l.pick(["正在安装浏览器组件", "正在安裝瀏覽器元件", "Installing browser component"]), format!("{} {}",l.pick(["已解包", "已解壓縮", "Extracted"]),fmt::file_size(bytes)), None),
++            BrowserInstall::Cancelling => (l.pick(["正在取消安装", "正在取消安裝", "Cancelling installation"]), String::new(), None),
++        };
++        let y=widgets::progress_card(&mut c,t,f,t.m.content_top,title,&detail,share);
++        let y=widgets::footnote(&mut c,t,f,y,l.pick(["首次使用将下载并安装浏览器组件，完成后自动打开。", "首次使用將下載並安裝瀏覽器元件，完成後自動開啟。", "The browser component will be downloaded and installed, then the browser will open."]));
++        let mut out=Vec::new();
++        if stage!=BrowserInstall::Cancelling {
++            let cancel=widgets::list(&mut c,t,f,y+t.m.card_gap,&[Row::new(l.pick(["取消安装", "取消安裝", "Cancel installation"]))]);
++            out.extend(hits(&cancel.rows,&[Action::BrowserCancelInstall]));
++        }
++        return Frame::new(t,c,out,l.pick(TITLE),t.m.content_top);
++    }
++    if !s.running && let Some(error)=&s.error {
++        let rows=widgets::list(&mut c,t,f,t.m.content_top,&[
++            Row::new(l.pick(["浏览器暂不可用", "瀏覽器暫時無法使用", "Browser unavailable"])).subtitle(error).trail(Trail::None),
++            Row::new(l.pick(["重试", "重試", "Retry"])),
++        ]);
++        return Frame::new(t,c,hits(&rows.rows[1..],&[Action::BrowserReload]),l.pick(TITLE),t.m.content_top);
++    }
 +    let label=if s.url.is_empty() || s.url.starts_with("file:") { l.pick(["输入网址", "輸入網址", "Enter web address"]) } else { &s.url };
 +    let address=widgets::list(&mut c,t,f,t.m.content_top,&[Row::new(label).trail(Trail::Arrow)]);
 +    let mut out=hits(&address.rows,&[Action::BrowserAddress]);
@@ -3620,6 +4118,211 @@ index ab27c29..626b005 100644
              };
              let conn = conn.handle();
              let s = KmsSurface {
+diff --git a/crates/skyward-vab/Cargo.toml b/crates/skyward-vab/Cargo.toml
+index ec33686..338395f 100644
+--- a/crates/skyward-vab/Cargo.toml
++++ b/crates/skyward-vab/Cargo.toml
+@@ -6,6 +6,7 @@ license.workspace = true
+ 
+ [dependencies]
+ anyhow = { workspace = true }
++crc32fast = "1.5.2"
+ libc = { workspace = true }
+ prost = "0.14.4"
+ skyward-block = { path = "../skyward-block" }
+diff --git a/crates/skyward-vab/src/boot.rs b/crates/skyward-vab/src/boot.rs
+index 3813349..f862442 100644
+--- a/crates/skyward-vab/src/boot.rs
++++ b/crates/skyward-vab/src/boot.rs
+@@ -53,6 +53,7 @@ const YES: i32 = 1;
+ pub enum BootControl<'a> {
+     Newer(Handle<'a>),
+     Older(Handle<'a>),
++    Legacy(Handle<'a>),
+ }
+ 
+ /// The slot the bootloader starts next, as the running boot control tells
+@@ -101,15 +102,20 @@ impl<'a> BootControl<'a> {
+             let control = service::find(binder, SERVICE)?.with_context(|| not_running(SERVICE))?;
+             return Ok(BootControl::Newer(control));
+         }
+-        let control = hidl::find(hardware, HARDWARE_SERVICE, INSTANCE)?.with_context(|| not_running(HARDWARE_SERVICE))?;
+-        Ok(BootControl::Older(control))
++        if let Some(control)=hidl::find(hardware,HARDWARE_SERVICE,INSTANCE)? {
++            return Ok(BootControl::Older(control));
++        }
++        let control=hidl::find(hardware,MERGE,INSTANCE)?.with_context(|| not_running(MERGE))?;
++        Ok(BootControl::Legacy(control))
+     }
+ 
+     /// The slot the bootloader starts next.
+     pub fn active(&self) -> Result<Slot> {
++        if matches!(self,Self::Legacy(_)) {return crate::qcom::active();}
+         let number = match self {
+             BootControl::Newer(c) => newer(c, GET_ACTIVE, |_| {}, |r| r.i32()),
+             BootControl::Older(c) => older(c, HARDWARE_SERVICE, ACTIVE, |_| {}, |r| r.i32()),
++            BootControl::Legacy(_) => unreachable!("legacy active slot was read from GPT"),
+         }
+         .context("ask which slot starts next")?;
+         match number {
+@@ -133,14 +139,14 @@ impl<'a> BootControl<'a> {
+     fn bootable(&self, slot: Slot) -> Result<bool> {
+         match self {
+             BootControl::Newer(c) => newer(c, IS_BOOTABLE, |p| p.i32(slot.number() as i32), |r| r.bool()),
+-            BootControl::Older(c) => older(c, FIRST, BOOTABLE, |m| m.u32(slot.number()), answered),
++            BootControl::Older(c) | BootControl::Legacy(c) => older(c, FIRST, BOOTABLE, |m| m.u32(slot.number()), answered),
+         }
+     }
+ 
+     fn successful(&self, slot: Slot) -> Result<bool> {
+         match self {
+             BootControl::Newer(c) => newer(c, IS_SUCCESSFUL, |p| p.i32(slot.number() as i32), |r| r.bool()),
+-            BootControl::Older(c) => older(c, FIRST, SUCCESSFUL, |m| m.u32(slot.number()), answered),
++            BootControl::Older(c) | BootControl::Legacy(c) => older(c, FIRST, SUCCESSFUL, |m| m.u32(slot.number()), answered),
+         }
+     }
+ 
+@@ -148,7 +154,7 @@ impl<'a> BootControl<'a> {
+     pub fn merge_status(&self) -> Result<MergeStatus> {
+         let said = match self {
+             BootControl::Newer(c) => newer(c, GET_MERGE_STATUS, |_| {}, |r| r.i32()),
+-            BootControl::Older(c) => older(c, MERGE, MERGE_STATUS, |_| {}, |r| r.i32()),
++            BootControl::Older(c) | BootControl::Legacy(c) => older(c, MERGE, MERGE_STATUS, |_| {}, |r| r.i32()),
+         }
+         .context("ask where an update stands")?;
+         Ok(match said {
+@@ -166,7 +172,7 @@ impl<'a> BootControl<'a> {
+         let what = || format!("tell the bootloader an update stands at {status:?}");
+         let done = match self {
+             BootControl::Newer(c) => newer(c, SET_SNAPSHOT_MERGE_STATUS, |p| p.i32(status as i32), |_| Ok(true)),
+-            BootControl::Older(c) => older(c, MERGE, SET_MERGE_STATUS, |m| m.u32(status as u32), |r| r.bool()),
++            BootControl::Older(c) | BootControl::Legacy(c) => older(c, MERGE, SET_MERGE_STATUS, |m| m.u32(status as u32), |r| r.bool()),
+         }
+         .with_context(what)?;
+         if !done {
+@@ -181,7 +187,7 @@ impl<'a> BootControl<'a> {
+         let what = || format!("have slot {} start next", slot.letter());
+         match self {
+             BootControl::Newer(c) => newer(c, SET_ACTIVE_SLOT, |p| p.i32(slot.number() as i32), |_| Ok(())).with_context(what),
+-            BootControl::Older(c) => {
++            BootControl::Older(c) | BootControl::Legacy(c) => {
+                 // The answer is whether it worked, and why not in text it
+                 // points at.
+                 let why = older(c, FIRST, SET_ACTIVE, |m| m.u32(slot.number()), |r| {
+diff --git a/crates/skyward-vab/src/lib.rs b/crates/skyward-vab/src/lib.rs
+index 22b650e..e86efb6 100644
+--- a/crates/skyward-vab/src/lib.rs
++++ b/crates/skyward-vab/src/lib.rs
+@@ -6,6 +6,8 @@ use std::path::Path;
+ 
+ #[cfg(target_os = "android")]
+ pub mod boot;
++#[cfg(any(target_os = "android", test))]
++mod qcom;
+ mod partitions;
+ pub mod snapshots;
+ 
+diff --git a/crates/skyward-vab/src/qcom.rs b/crates/skyward-vab/src/qcom.rs
+new file mode 100644
+index 0000000..1cbe512
+--- /dev/null
++++ b/crates/skyward-vab/src/qcom.rs
+@@ -0,0 +1,95 @@
++//! Qualcomm's active slot bit in the boot partitions' GPT attributes.
++//! Older Boot Control 1.1 exposes slot health through HIDL, but has no
++//! getActiveBootSlot method. Read the same bit its boot control maintains.
++use crate::Slot;
++use anyhow::{Context, Result, ensure};
++use std::io::{Read, Seek, SeekFrom};
++
++// qcom/bootctrl/gpt-utils: AB_FLAG_OFFSET = 48 + 6, SLOT_ACTIVE = 1 << 2.
++const SLOT_ACTIVE: u64 = 1 << 50;
++
++fn u32_at(bytes: &[u8], at: usize) -> u32 {u32::from_le_bytes(bytes[at..at+4].try_into().expect("four bytes"))}
++fn u64_at(bytes: &[u8], at: usize) -> u64 {u64::from_le_bytes(bytes[at..at+8].try_into().expect("eight bytes"))}
++
++/// Read and validate the primary GPT without modifying the disk.
++fn active_from_gpt(disk: &mut (impl Read + Seek), sector: u64) -> Result<Slot> {
++    ensure!(matches!(sector,512|1024|2048|4096),"unsupported GPT sector size {sector}");
++    disk.seek(SeekFrom::Start(sector))?;
++    let mut header=vec![0u8;sector as usize];disk.read_exact(&mut header)?;
++    ensure!(&header[..8]==b"EFI PART","boot disk has no GPT signature");
++    let size=u32_at(&header,12) as usize;
++    ensure!((92..=header.len()).contains(&size),"invalid GPT header length");
++    let expected=u32_at(&header,16);header[16..20].fill(0);
++    ensure!(crc32fast::hash(&header[..size])==expected,"boot disk GPT header checksum mismatch");
++    let count=u32_at(&header,80) as usize;let entry_size=u32_at(&header,84) as usize;
++    ensure!((1..=4096).contains(&count) && (128..=4096).contains(&entry_size) && entry_size.is_multiple_of(128),"invalid GPT entry geometry");
++    let length=count.checked_mul(entry_size).filter(|n| *n<=4*1024*1024).context("GPT entries exceed the supported size")?;
++    let offset=u64_at(&header,72).checked_mul(sector).context("GPT entry offset overflow")?;
++    ensure!(offset>=2*sector,"invalid GPT entry offset");
++    disk.seek(SeekFrom::Start(offset))?;
++    let mut entries=vec![0u8;length];disk.read_exact(&mut entries)?;
++    ensure!(crc32fast::hash(&entries)==u32_at(&header,88),"boot disk GPT entries checksum mismatch");
++    let mut slots=[None;2];
++    for entry in entries.chunks_exact(entry_size) {
++        if entry[..16].iter().all(|b| *b==0) {continue;}
++        let name: Vec<u16>=entry[56..128].as_chunks::<2>().0.iter().map(|b|u16::from_le_bytes(*b)).take_while(|c| *c!=0).collect();
++        let slot=match String::from_utf16(&name).ok().as_deref() {Some("boot_a")=>0,Some("boot_b")=>1,_=>continue};
++        ensure!(slots[slot].is_none(),"boot disk has duplicate boot partition names");
++        slots[slot]=Some(u64_at(entry,48) & SLOT_ACTIVE != 0);
++    }
++    match slots {
++        [Some(true),Some(false)]=>Ok(Slot::A),
++        [Some(false),Some(true)]=>Ok(Slot::B),
++        _=>anyhow::bail!("boot disk does not identify exactly one active A/B slot"),
++    }
++}
++
++#[cfg(target_os = "android")]
++pub fn active() -> Result<Slot> {
++    use std::{fs,path::{Path,PathBuf}};
++    fn parent(name: &str)->Result<PathBuf> {
++        let partition=fs::canonicalize(Path::new("/dev/block/by-name").join(name))?;
++        let name=partition.file_name().context("boot partition has no device name")?;
++        let sys=fs::canonicalize(Path::new("/sys/class/block").join(name))?;
++        ensure!(sys.join("partition").is_file(),"boot is not a physical GPT partition");
++        Ok(sys.parent().context("boot partition has no parent disk")?.to_owned())
++    }
++    let disk=parent("boot_a")?;
++    ensure!(disk==parent("boot_b")?,"boot slots are on different disks");
++    let sector=fs::read_to_string(disk.join("queue/logical_block_size"))?.trim().parse()?;
++    let device=Path::new("/dev/block").join(disk.file_name().context("boot disk has no name")?);
++    active_from_gpt(&mut fs::File::open(device)?,sector).context("read Qualcomm's active boot slot")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++    fn image(sector:usize,a:bool,b:bool)->Vec<u8> {
++        let mut bytes=vec![0u8;sector*2+256];
++        let entries=&mut bytes[sector*2..];
++        for (n,(name,active)) in [("boot_a",a),("boot_b",b)].into_iter().enumerate() {
++            let entry=&mut entries[n*128..(n+1)*128];entry[0]=1;
++            entry[48..56].copy_from_slice(&(if active {SLOT_ACTIVE} else {0}).to_le_bytes());
++            for (i,c) in name.encode_utf16().enumerate() {entry[56+i*2..58+i*2].copy_from_slice(&c.to_le_bytes());}
++        }
++        let crc=crc32fast::hash(entries);let h=&mut bytes[sector..sector*2];
++        h[..8].copy_from_slice(b"EFI PART");h[12..16].copy_from_slice(&92u32.to_le_bytes());
++        h[72..80].copy_from_slice(&2u64.to_le_bytes());h[80..84].copy_from_slice(&2u32.to_le_bytes());
++        h[84..88].copy_from_slice(&128u32.to_le_bytes());h[88..92].copy_from_slice(&crc.to_le_bytes());
++        let crc=crc32fast::hash(&h[..92]);h[16..20].copy_from_slice(&crc.to_le_bytes());bytes
++    }
++    #[test] fn reads_the_flag_from_both_disk_sector_sizes() {
++        for sector in [512,4096] {
++            assert_eq!(active_from_gpt(&mut Cursor::new(image(sector,true,false)),sector as u64).unwrap(),Slot::A);
++            assert_eq!(active_from_gpt(&mut Cursor::new(image(sector,false,true)),sector as u64).unwrap(),Slot::B);
++        }
++    }
++    #[test] fn rejects_ambiguous_flags_and_invalid_checksums() {
++        for (a,b) in [(false,false),(true,true)] {assert!(active_from_gpt(&mut Cursor::new(image(4096,a,b)),4096).is_err());}
++        let mut header=image(4096,true,false);header[4096+32]^=1;
++        assert!(active_from_gpt(&mut Cursor::new(header),4096).is_err());
++        let mut table=image(4096,true,false);table[8192+48]^=1;
++        assert!(active_from_gpt(&mut Cursor::new(table),4096).is_err());
++    }
++}
 diff --git a/crates/skyward/Cargo.toml b/crates/skyward/Cargo.toml
 index c653811..84242d5 100644
 --- a/crates/skyward/Cargo.toml
@@ -3635,16 +4338,16 @@ index c653811..84242d5 100644
  skyward-config = { path = "../skyward-config" }
 diff --git a/crates/skyward/src/browser.rs b/crates/skyward/src/browser.rs
 new file mode 100644
-index 0000000..cc88ccf
+index 0000000..7b5b2de
 --- /dev/null
 +++ b/crates/skyward/src/browser.rs
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,154 @@
 +//! WPE's isolated process, input pipe and exported webpage frames.
 +use anyhow::{Context, Result, ensure};
 +use serde_json::{Value, json};
-+use skyward_net::http::Servers;
++use skyward_net::{download, github, http::{self, Servers}};
 +use skyward_net::network::ProxyKind;
-+use skyward_ui::app::{BrowserCommand, BrowserPixels};
++use skyward_ui::app::{BrowserCommand, BrowserInstall, BrowserPixels};
 +use std::fs::{self, OpenOptions};
 +use std::io::{BufRead, BufReader, Read, Write};
 +use std::os::fd::RawFd;
@@ -3652,16 +4355,86 @@ index 0000000..cc88ccf
 +use std::os::unix::process::CommandExt;
 +use std::path::Path;
 +use std::process::{Child, ChildStdin, Command, Stdio};
-+use std::sync::Arc;
++use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
++use std::time::{Duration, Instant};
 +
 +pub const RUNNER: &str = "/system/bin/skyward-browser";
 +const ROOT: &str = "/data/skyward/browser/root";
 +const DOWNLOADS: &str = "/sdcard/Download/Skyward";
++pub fn installed() -> bool { Path::new(ROOT).join("opt/wpe/browser").is_file() }
++
++pub enum InstallEvent { Progress(BrowserInstall), Ended(Result<(), String>) }
++pub struct RuntimeInstaller {
++    stop: Arc<AtomicBool>,
++    agent: Arc<Mutex<Option<ureq::Agent>>>,
++    worker: skyward_sys::worker::Worker<InstallEvent>,
++}
++
++impl RuntimeInstaller {
++    pub fn start(servers: Servers) -> Result<Self> {
++        let stop=Arc::new(AtomicBool::new(false));
++        let agent=Arc::new(Mutex::new(None));
++        let (stopping,using)=(stop.clone(),agent.clone());
++        let worker=skyward_sys::worker::Worker::start("browser-install",move |tell| {
++            let work=(|| -> Result<()> {
++                let a=http::agent(servers);
++                *using.lock().expect("browser download agent lock")=Some(a.clone());
++                tell.tell(InstallEvent::Progress(BrowserInstall::Locating));
++                let asset=github::browser_runtime(&a,skyward_info::VERSION)?;
++                ensure!(!stopping.load(Ordering::Relaxed),"浏览器组件安装已取消");
++                let base=Path::new(ROOT).parent().expect("browser root has a parent");
++                fs::create_dir_all(base)?;
++                let path=base.join(format!("runtime-{}.zip",&asset.sha256[..16]));
++                let located=github::locate(&a,&asset.url,skyward_info::VERSION).ok();
++                let mut last=None;
++                let mut finished=false;
++                let mut shown=Instant::now()-Duration::from_secs(1);
++                // A retry reopens the checked partial file and requests its remainder.
++                'tries: for _ in 0..3 {
++                    for url in asset.sources(located.clone()) {
++                        ensure!(!stopping.load(Ordering::Relaxed),"浏览器组件安装已取消");
++                        let fetched=download::fetch(&a,&url,&path,&download::Sum::Sha256(asset.sha256.clone()),&stopping,&mut |progress| {
++                            if shown.elapsed()>=Duration::from_millis(200) {
++                                tell.tell(InstallEvent::Progress(BrowserInstall::Transfer(progress))); shown=Instant::now();
++                            }
++                        });
++                        match fetched {
++                            Ok(()) => {finished=true;break 'tries;}
++                            Err(e) if e.is::<download::NoRoom>() || e.is::<download::Damaged>() => return Err(e),
++                            Err(e) => last=Some(e),
++                        }
++                    }
++                }
++                if !finished { return Err(last.context("无法下载浏览器组件")?); }
++                ensure!(fs::metadata(&path)?.len()==asset.size,"下载的浏览器组件大小不符");
++                tell.tell(InstallEvent::Progress(BrowserInstall::Extracting{bytes:0}));
++                skyward_install::browser::install(&path,base,&stopping,&mut |bytes| {
++                    if shown.elapsed()>=Duration::from_millis(200) {
++                        tell.tell(InstallEvent::Progress(BrowserInstall::Extracting{bytes})); shown=Instant::now();
++                    }
++                })?;
++                let _=fs::remove_file(path);
++                Ok(())
++            })();
++            let result=work.map_err(|e| if stopping.load(Ordering::Relaxed) {"已取消安装，点按重试可继续下载".to_owned()} else {format!("{e:#}。请检查 Wi-Fi、代理或 DNS 后重试")});
++            tell.tell(InstallEvent::Ended(result));
++        })?;
++        Ok(Self{stop,agent,worker})
++    }
++    pub fn fd(&self)->RawFd {self.worker.fd()}
++    pub fn events(&self)->Vec<InstallEvent> {self.worker.events()}
++    pub fn stop(&self) {
++        self.stop.store(true,Ordering::Relaxed);
++        if let Some(agent)=self.agent.lock().expect("browser download agent lock").take() {agent.shutdown();}
++    }
++}
 +pub enum Event { Message(Value), Frame(Arc<BrowserPixels>), Ended }
 +pub struct Browser { child: Child, input: ChildStdin, reader: skyward_sys::worker::Worker<Event> }
 +impl Browser {
 +    pub fn start(w: u32,h: u32,servers: &Servers) -> Result<Self> {
-+        ensure!(Path::new(ROOT).join("opt/wpe/browser").is_file(), "浏览器组件未安装，请安装 skyward-browser-runtime.zip 后重试");
++        ensure!(installed(), "浏览器组件尚未安装完成，请重试");
++        // Repair roots provisioned by builds that inherited init's umask.
++        skyward_install::browser::prepare(Path::new(ROOT)).context("打开浏览器组件目录")?;
 +        fs::create_dir_all(DOWNLOADS).context("create the browser download directory")?;
 +        // Only this browser-owned subdirectory is exposed to the engine.
 +        let downloads=std::ffi::CString::new(DOWNLOADS)?;
@@ -3671,6 +4444,7 @@ index 0000000..cc88ccf
 +        let dns=state.dns_servers();
 +        let resolver=dns.iter().map(|ip|format!("nameserver {ip}\n")).collect::<String>();
 +        fs::write(Path::new(ROOT).join("etc/resolv.conf"),format!("{resolver}options timeout:2 attempts:2\n"))?;
++        fs::set_permissions(Path::new(ROOT).join("etc/resolv.conf"),fs::Permissions::from_mode(0o644))?;
 +        let p=&state.settings.proxy;
 +        let host=if p.server.contains(':'){format!("[{}]",p.server)}else{p.server.clone()};
 +        let proxy=match p.kind {ProxyKind::None=>String::new(),ProxyKind::Http=>format!("http://{host}:{}",p.port),ProxyKind::Socks5=>format!("socks5://{host}:{}",p.port)};
@@ -3751,7 +4525,7 @@ index f4b7775..ac4bff2 100644
  
  /// The phone as the partitions of the slot's installed system describe it,
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index c770fe4..fccd974 100644
+index c770fe4..de16222 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
 @@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
@@ -3880,10 +4654,12 @@ index c770fe4..fccd974 100644
      if names.is_empty() {
          return Ok(());
      }
-@@ -841,6 +886,9 @@ fn recovery() -> Result<()> {
+@@ -841,6 +886,11 @@ fn recovery() -> Result<()> {
  fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_config::Service>> {
      match skyward_vab::mount_partitions(slot) {
          Ok(mounts) => {
++            let kept = secure::stage_vendor_runtime()?;
++            if kept > 0 { skyward_sys::kmsg(&format!("{kept} of the installed vendor's runtime files are kept in recovery memory"))?; }
 +            if let Err(e) = skyward_block::fstab::cache() {
 +                skyward_sys::kmsg(&format!("the filesystem table could not be kept: {e:#}"))?;
 +            }
@@ -3891,11 +4667,39 @@ index c770fe4..fccd974 100644
                  skyward_sys::kmsg(&format!("super: {d}"))?;
              }
 diff --git a/crates/skyward/src/secure.rs b/crates/skyward/src/secure.rs
-index deefa91..21fe7c5 100644
+index deefa91..a61452f 100644
 --- a/crates/skyward/src/secure.rs
 +++ b/crates/skyward/src/secure.rs
-@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
+@@ -8,9 +8,38 @@ use std::fs;
+ use std::path::{Path, PathBuf};
+ use std::time::{Duration, Instant};
  
++/// Snapshot vendor-specific dependencies over the ramdisk's fallback copies.
++/// The runtime stays usable after an installer releases vendor, and its
++/// libraries match the hardware programs from the installed ROM.
++pub fn stage_vendor_runtime() -> Result<usize> {
++    let manifest = match fs::read_to_string("/system/etc/skyward/vendor-runtime.files") {
++        Ok(text) => text,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
++        Err(e) => return Err(e).context("read vendor runtime inventory"),
++    };
++    let cache = Path::new("/skyward/run/vendor-runtime");
++    fs::create_dir_all(cache)?;
++    let mut count = 0;
++    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
++        let (source, target) = line.split_once('\t').context("invalid vendor runtime inventory")?;
++        let (source, target) = (Path::new(source), Path::new(target));
++        ensure!(source.starts_with("/vendor") && (target.starts_with("/system/lib64") || target.starts_with("/system/etc/firmware")), "invalid vendor runtime path");
++        if !source.is_file() || !target.is_file() || skyward_block::mount::is_mount_point(target)? { continue; }
++        let copied = cache.join(target.file_name().context("vendor runtime file has no name")?);
++        fs::copy(source, &copied).with_context(|| format!("keep {} in recovery memory", source.display()))?;
++        fs::set_permissions(&copied, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
++        skyward_block::mount::bind(&copied, target)?;
++        count += 1;
++    }
++    Ok(count)
++}
++
  /// Where a phone keeps the bundles of shared libraries its own partitions
  /// were built against.
 -const BUNDLE_DIRS: [&str; 4] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex"];
@@ -3906,7 +4710,7 @@ index deefa91..21fe7c5 100644
  
  /// The file inside a bundle that holds its filesystem. It is stored whole,
  /// so the bundle can be opened where it lies.
-@@ -141,7 +144,11 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+@@ -141,7 +170,11 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
  /// holds the two.
  fn describe_hardware(wanted: &[String]) -> Result<String> {
      let mut out = String::from("<manifest version=\"1.0\" type=\"framework\">\n");
@@ -3918,7 +4722,7 @@ index deefa91..21fe7c5 100644
          let (package, rest) = name
              .split_once('@')
              .with_context(|| format!("{name} does not read as a hardware service's name"))?;
-@@ -175,7 +182,12 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
+@@ -175,7 +208,12 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
          return Ok(None);
      };
      let (offset, length) = image(&file)?;
@@ -4038,7 +4842,7 @@ index ad36bfb..245743d 100644
      file.sync_all().with_context(|| format!("write {WRITING}"))?;
      fs::rename(WRITING, FILE).with_context(|| format!("move {WRITING} over {FILE}"))?;
 diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
-index 8ed3ceb..dec9e7a 100644
+index 8ed3ceb..0e2fb0e 100644
 --- a/crates/skyward/src/ui.rs
 +++ b/crates/skyward/src/ui.rs
 @@ -1,4 +1,5 @@
@@ -4172,15 +4976,16 @@ index 8ed3ceb..dec9e7a 100644
          let mounted = skyward_vab::mounted_partitions(slot)?;
          let busy = services::pin(&services, &mounted)?;
          skyward_vab::release_partitions(slot, &busy)
-@@ -1216,6 +1250,7 @@ struct Pages<'a> {
+@@ -1216,6 +1250,8 @@ struct Pages<'a> {
      skyward_updater: Option<updates::Worker>,
      /// The terminal page's shell, from when the page first asks for one.
      shell: Option<pty::Shell>,
 +    browser: Option<browser::Browser>,
++    browser_installer: Option<browser::RuntimeInstaller>,
      /// The USB drive plugged in, looked for each second.
      plugged: Option<Plugged>,
      seen: Option<String>,
-@@ -1275,6 +1310,7 @@ impl<'a> Pages<'a> {
+@@ -1275,6 +1311,7 @@ impl<'a> Pages<'a> {
          };
          let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
          app.set_screen_corners(cfg.display.corner_radius as f32);
@@ -4188,7 +4993,7 @@ index 8ed3ceb..dec9e7a 100644
          // The settings kept from the starts before are back before the first
          // frame, and before file transfer starts with its switch and the time
          // zone. The pages speak the language chosen then, or else the one the
-@@ -1341,6 +1377,7 @@ impl<'a> Pages<'a> {
+@@ -1341,6 +1378,7 @@ impl<'a> Pages<'a> {
          let by_name = Path::new(skyward_block::BY_NAME);
          let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
          app.state.recovery_partitions = both("recovery")?;
@@ -4196,7 +5001,7 @@ index 8ed3ceb..dec9e7a 100644
          app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
          // The second system's work; the systems are read at once, for the home
          // page to name the one that starts, once a switch cut off before is
-@@ -1365,6 +1402,9 @@ impl<'a> Pages<'a> {
+@@ -1365,6 +1403,9 @@ impl<'a> Pages<'a> {
                  app.report(&format!("{e:#}"), monotonic_ms());
              }
          }
@@ -4206,7 +5011,7 @@ index 8ed3ceb..dec9e7a 100644
          Ok(Pages {
              cfg,
              programs,
-@@ -1414,7 +1454,7 @@ impl<'a> Pages<'a> {
+@@ -1414,7 +1455,7 @@ impl<'a> Pages<'a> {
              systems_worker,
              switch_asked: false,
              switched: false,
@@ -4215,15 +5020,16 @@ index 8ed3ceb..dec9e7a 100644
              wlan: None,
              scanned_at: Instant::now(),
              checker: None,
-@@ -1422,6 +1462,7 @@ impl<'a> Pages<'a> {
+@@ -1422,6 +1463,8 @@ impl<'a> Pages<'a> {
              skyward_checker: None,
              skyward_updater: None,
              shell: None,
 +            browser: None,
++            browser_installer: None,
              plugged: None,
              seen: None,
              drive_at: Instant::now(),
-@@ -1510,6 +1551,16 @@ impl<'a> Pages<'a> {
+@@ -1510,6 +1553,16 @@ impl<'a> Pages<'a> {
              }
              Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
          }
@@ -4240,7 +5046,7 @@ index 8ed3ceb..dec9e7a 100644
          // A switch asked for finishes one cut off before itself; fastboot leaves
          // /metadata to fastbootd until the recovery's pages come up.
          if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
-@@ -1607,6 +1658,7 @@ impl<'a> Pages<'a> {
+@@ -1607,6 +1660,7 @@ impl<'a> Pages<'a> {
          self.skyward_told(now)?;
          self.decrypt_told(now)?;
          self.shell_told()?;
@@ -4248,15 +5054,41 @@ index 8ed3ceb..dec9e7a 100644
          self.take_in(drive_told, now)?;
          self.offer_storage(now)
      }
-@@ -1631,6 +1683,73 @@ impl<'a> Pages<'a> {
+@@ -1631,6 +1685,118 @@ impl<'a> Pages<'a> {
          Ok(())
      }
  
 +    fn browser_command(&mut self, command: BrowserCommand) {
 +        match command {
 +            BrowserCommand::Close => { self.browser = None; }
++            BrowserCommand::CancelInstall => {
++                if let Some(installer)=&self.browser_installer {
++                    installer.stop();
++                    self.app.state.browser.install=Some(skyward_ui::app::BrowserInstall::Cancelling);
++                    self.app.browser_changed();
++                }
++            }
 +            BrowserCommand::Open => {
-+                if self.browser.is_some() { return; }
++                if self.browser.is_some() || self.browser_installer.is_some() { return; }
++                self.app.state.browser.error=None;
++                self.app.state.browser.loading=true;
++                if !self.app.state.data.storage_open() {
++                    self.app.state.browser.error=Some("请先解密并挂载内部存储，再打开浏览器".into());
++                    self.app.state.browser.loading=false;
++                    self.app.browser_changed();
++                    return;
++                }
++                if !browser::installed() {
++                    match browser::RuntimeInstaller::start(self.servers.clone()) {
++                        Ok(installer) => {
++                            self.browser_installer=Some(installer);
++                            self.app.state.browser.install=Some(skyward_ui::app::BrowserInstall::Locating);
++                        }
++                        Err(e) => {self.app.state.browser.error=Some(format!("{e:#}"));self.app.state.browser.loading=false;}
++                    }
++                    self.app.browser_changed();
++                    return;
++                }
 +                let viewport = skyward_ui::app::browser_viewport(&self.app.theme());
 +                match browser::Browser::start(800, (viewport.h * 800.0 / viewport.w).round() as u32, &self.servers) {
 +                    Ok(browser) => { self.browser = Some(browser); self.app.state.browser.running = true; }
@@ -4276,6 +5108,25 @@ index 8ed3ceb..dec9e7a 100644
 +    }
 +
 +    fn browser_told(&mut self, now: u64) {
++        let installation=self.browser_installer.as_ref().map(browser::RuntimeInstaller::events).unwrap_or_default();
++        for event in installation {
++            match event {
++                browser::InstallEvent::Progress(stage) => {
++                    if self.app.state.browser.install!=Some(skyward_ui::app::BrowserInstall::Cancelling) {
++                        self.app.state.browser.install=Some(stage);
++                    }
++                }
++                browser::InstallEvent::Ended(result) => {
++                    self.browser_installer=None;
++                    self.app.state.browser.install=None;
++                    match result {
++                        Ok(()) => self.browser_command(BrowserCommand::Open),
++                        Err(error) => {self.app.state.browser.error=Some(error);self.app.state.browser.loading=false;}
++                    }
++                }
++            }
++            self.app.browser_changed();
++        }
 +        let Some(browser) = &self.browser else { return; };
 +        let events = browser.events();
 +        let mut changed = false;
@@ -4322,7 +5173,7 @@ index 8ed3ceb..dec9e7a 100644
      /// One click of the motor, as strong as the settings say.
      fn click(&mut self) -> Result<()> {
          if let Some(h) = &mut self.haptics {
-@@ -1714,7 +1833,7 @@ impl<'a> Pages<'a> {
+@@ -1714,7 +1880,7 @@ impl<'a> Pages<'a> {
          // After the frame is on the panel, so a panel coming back on lights
          // with what it should show now, never with what it showed when it
          // went off.
@@ -4331,23 +5182,25 @@ index 8ed3ceb..dec9e7a 100644
              self.surface.settle()?;
          }
          self.backlight.show(panel)?;
-@@ -1802,6 +1921,7 @@ impl<'a> Pages<'a> {
+@@ -1802,6 +1968,8 @@ impl<'a> Pages<'a> {
          if let Some(s) = &self.systems_worker {
              fds.push(s.fd());
          }
 +        if let Some(b) = &self.browser { fds.push(b.fd()); }
++        if let Some(i) = &self.browser_installer { fds.push(i.fd()); }
          fds.push(self.readings.fd());
          wait(&fds, timeout)
      }
-@@ -1825,6 +1945,7 @@ impl<'a> Pages<'a> {
+@@ -1825,6 +1993,8 @@ impl<'a> Pages<'a> {
              || self.downloader.is_some()
              || self.skyward_checker.is_some()
              || self.skyward_updater.is_some()
 +            || self.browser.is_some()
++            || self.browser_installer.is_some()
              || systems_busy;
          let joining = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
          let running = match &self.shell {
-@@ -2519,7 +2640,10 @@ impl Pages<'_> {
+@@ -2519,7 +2689,10 @@ impl Pages<'_> {
              }
              Effect::InstallPath(path) => {
                  if self.may_install(now)? {
@@ -4359,7 +5212,7 @@ index 8ed3ceb..dec9e7a 100644
                  }
              }
              Effect::Flash { partition, pick } => {
-@@ -2599,6 +2723,7 @@ impl Pages<'_> {
+@@ -2599,6 +2772,7 @@ impl Pages<'_> {
                  skyward_sys::kmsg("merging the update, as the update page asked")?;
                  self.merger = Some(merge::Merger::start(slot, true)?);
              }
@@ -4367,7 +5220,7 @@ index 8ed3ceb..dec9e7a 100644
              Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
              Effect::ScanWlan => {
                  self.scanned_at = Instant::now();
-@@ -2608,6 +2733,12 @@ impl Pages<'_> {
+@@ -2608,6 +2782,12 @@ impl Pages<'_> {
                  wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
              }
              Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
@@ -4380,7 +5233,7 @@ index 8ed3ceb..dec9e7a 100644
              Effect::CheckUpdate => self.check_update()?,
              Effect::Download(release) => self.download(release, now)?,
              Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
-@@ -2700,7 +2831,13 @@ impl Pages<'_> {
+@@ -2700,7 +2880,13 @@ impl Pages<'_> {
      /// internal storage go, which the page is told otherwise.
      fn may_install(&mut self, now: u64) -> Result<bool> {
          ensure!(self.installer.is_none(), "an installer is running already");

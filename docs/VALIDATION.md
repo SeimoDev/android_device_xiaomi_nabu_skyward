@@ -13,7 +13,7 @@ The recovery base was tested on Xiaomi Pad 5 (nabu) running
 - The published patch applies to the pinned upstream commit, the bootstrap can run repeatedly on that checkout, and its reconstructed source passed the relevant host tests.
 
 The bundled installer saved the original boot backup, wrote the current boot_a partition and verified its contents by reading it back on the tablet. Saved brightness and automatic unencrypted-data mounting were also confirmed after a fresh recovery start.
-Credential-based FBE decryption remains unverified because the tested ROM disables encryption.
+This original HyperOS 4 / Android 17 validation used unencrypted userdata.
 
 ## v0.3.1-nabu.2
 
@@ -31,9 +31,7 @@ reconstructed source was compared with the files used for the published image.
 
 The browser runtime is a separate data-resident component. It uses software
 rendering; media and WebGL are disabled. Its mount namespace, chroot and
-unprivileged UID run with WebKit's bubblewrap sandbox disabled. Credential-based
-FBE decryption and this release's browser download UI have not been validated
-across other ROMs.
+unprivileged UID run with WebKit's bubblewrap sandbox disabled. This release's browser download UI has not been validated across other ROMs.
 
 ## v0.3.1-nabu.3
 
@@ -47,3 +45,44 @@ filesystem table after vendor disappears and preserving a complete RAM backing
 image when a source read is short. Android release compilation and Clippy with
 warnings denied completed successfully. The combined device patch reconstructs
 the source used to build the release image.
+
+## HyperOS 3 / Android 16 compatibility
+
+The updated image was temporarily booted with
+`nabu_XiaomiPad5_OS3.0.303.0.WNXCNXM_16.0.zip`. Firmware mounted successfully,
+41 vendor runtime files were staged in RAM, the hardware Gatekeeper was selected,
+and SharedSecret negotiation completed. The encrypted F2FS data partition opened;
+after the user entered the existing screen-lock credential, no users remained
+locked. The user confirmed access to the original internal-storage files and
+working Wi-Fi on this packaged image.
+
+The mount-option regression and nabu service-selection checks passed (40
+skyward-block tests and 3 nabu fixture tests). Android release compilation and
+Clippy with warnings denied also passed.
+
+## Automatic browser component installation
+
+The browser entry downloads a missing runtime from the latest device GitHub
+Release and opens it after installation. Targeted checks passed for exact asset
+selection and digest requirements, retaining an existing runtime on failure,
+cancellation, and keeping the installation page active until the worker ends.
+The published runtime ZIP was also unpacked successfully by the new installer.
+Android release compilation and Clippy with warnings denied passed; the download
+and error pages were rendered in both light and dark themes at nabu's panel size.
+The combined patch reconstructs the sources used for the boot image.
+
+On the tablet, the component downloaded and installed through the browser entry.
+The installed chroot and public resources were corrected to be accessible by the
+unprivileged browser, and the user confirmed the browser works. The updated image
+includes installation-time normalization and startup repair of existing runtime
+permissions. Targeted regression checks also passed with recovery's umask 077
+and with a startup page archived with mode 000.
+
+## Boot Control 1.1 slot discovery
+
+The final image was temporarily booted on the tablet. Slot queries returned
+current A, next active A, both slots bootable, A successful, B not yet marked
+successful, and merge status None. The primary GPT header and entry checksums
+also matched. Targeted tests covered both 512-byte and 4096-byte sectors, A and B
+active flags, ambiguous flags and corrupted checksums. Android release compilation
+and Clippy with warnings denied passed.

@@ -23,4 +23,4 @@ jobs:
         run: rustup toolchain install 1.100.0 --profile minimal
       - name: Validate recovery code
         working-directory: work/skyward
-        run: cargo test --locked -p skyward-bootimg -p skyward-install -p skyward-config -p skyward-info -p skyward-ui
+        run: cargo test --locked -p skyward-vab -p skyward-block -p skyward-programs -p skyward-net -p skyward-bootimg -p skyward-install -p skyward-config -p skyward-info -p skyward-ui

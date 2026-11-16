@@ -13,7 +13,7 @@ Unofficial Skyward 0.3.1 port for **Xiaomi Pad 5 / nabu**, maintained by **Seimo
 | Display | 1600 × 2560 LCD, 360 dpi |
 | Layout | A/B, recovery-as-boot, 128 MiB boot partition |
 | Kernel | ROM-provided `4.14.180-moon-os3-ga5805c039` |
-| Tested ROM | `HyperOS_4.0.0.41_nabu_A17_by_zxcwsurx_20260920.zip` |
+| Tested ROMs | HyperOS 4 / Android 17 port; `nabu_XiaomiPad5_OS3.0.303.0.WNXCNXM_16.0.zip` |
 | Vendor runtime | VNDK 30 |
 | Maintainer | Seimo — [GitHub](https://github.com/SeimoDev), [X](https://x.com/SeimoDev) |
 
@@ -21,11 +21,11 @@ Unofficial Skyward 0.3.1 port for **Xiaomi Pad 5 / nabu**, maintained by **Seimo
 
 Display, touch, root ADB, MTP session, Wi-Fi scanning, Wi-Fi connection and internet access have been tested on the tablet. The supplied ROM's unencrypted F2FS `/data` opens successfully, and the existing internal-storage files are accessible through the file manager. The About page displays the device maintainer and public profile URLs. The Install page provides an **Install Skyward to boot** entry for the current slot.
 
-The ROM disables file and metadata encryption. Credential-based FBE decryption on other ROMs is unverified; SharedSecret negotiation on this vendor returns error `-38`. Other ROM versions require their own hardware validation. The image uses the recovery base's permissive SELinux and root ADB configuration.
+On `nabu_XiaomiPad5_OS3.0.303.0.WNXCNXM_16.0.zip`, Wi-Fi and credential-based decryption of encrypted F2FS userdata have also been confirmed on the tablet. The metadata encryption layer opens, and entering the existing screen-lock password unlocks the original internal-storage files. Slot discovery supports this ROM’s Boot Control 1.1 service and reads Qualcomm’s next-active-slot flag from GPT. The image uses the recovery base's permissive SELinux and root ADB configuration.
 
 ## Browser and advanced networking
 
-The home page includes a **Browser** entry below WLAN. Install the separate `skyward-browser-runtime.zip` component in Skyward to provide WPE WebKit, then open the browser from the home page. Its address bar, touch input, keyboard and navigation controls are integrated into the recovery. Downloads are saved in `/sdcard/Download/Skyward`; the Downloads button opens that folder.
+The home page includes a **Browser** entry below WLAN. When the WPE WebKit component is missing, opening the browser downloads `skyward-browser-runtime.zip` from this device repository’s latest GitHub Release, verifies it, installs it and opens the browser automatically. Connect WLAN and unlock internal storage first. Installation shows progress, supports cancellation and resumes partial downloads on retry. The component can also be installed manually in Skyward. Its address bar, touch input, keyboard and navigation controls are integrated into the recovery. Downloads are saved in `/sdcard/Download/Skyward`; the Downloads button opens that folder.
 
 **WLAN → Advanced network settings** provides HTTP CONNECT / SOCKS5 proxy settings and automatic / manual DNS. The browser takes these settings when it starts. Browser sources, runtime build instructions and current limitations are in [browser/README.md](browser/README.md).
 
