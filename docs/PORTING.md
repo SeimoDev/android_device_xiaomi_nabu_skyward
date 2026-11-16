@@ -32,3 +32,9 @@ The tested ROM disables both file and metadata encryption. On a normal recovery 
 ## Maintainer information
 
 `nabu.toml` declares Seimo as the device maintainer, with `https://github.com/SeimoDev` and `https://x.com/SeimoDev`. Skyward displays this card on the About page independently of upstream recovery attribution.
+
+## Installer partition lifetime
+
+APEX payloads used by the hardware services are staged under `/skyward/run/apex` in the recovery ramdisk before attaching their loop devices. This keeps the mounted VNDK and runtime independent of the logical partitions an installer must release. Installation pins files held by dynamically started processes as well as the configured services, and closes the browser process group before starting the installer.
+
+The booted vendor/odm fstab is captured at `/skyward/run/fstab.snapshot`. Filesystem operations continue using that table after vendor is detached. The filesystem repair/format page currently enumerates data, metadata and cache; nabu has no standalone cache partition.

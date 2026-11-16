@@ -84,10 +84,20 @@ index 0e6e510..5530906 100644
      fn a_call_opens_with_the_header_and_the_interface_name() {
          let p = Parcel::call("a.b.IC");
 diff --git a/crates/skyward-block/src/fstab.rs b/crates/skyward-block/src/fstab.rs
-index f75cbad..c03d54b 100644
+index f75cbad..855ce2a 100644
 --- a/crates/skyward-block/src/fstab.rs
 +++ b/crates/skyward-block/src/fstab.rs
-@@ -29,6 +29,12 @@ impl Entry {
+@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
+ /// Where the phone's own partitions keep the table.
+ pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+ 
++/// The booted system's table remains available after installation detaches vendor.
++const SNAPSHOT: &str = "/skyward/run/fstab.snapshot";
++
+ /// One filesystem the phone knows about.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Entry {
+@@ -29,6 +32,12 @@ impl Entry {
      }
  }
  
@@ -100,7 +110,88 @@ index f75cbad..c03d54b 100644
  /// Every filesystem a table names. A phone may name the same mount point
  /// more than once, once per filesystem it might hold.
  pub fn entries(text: &str) -> Vec<Entry> {
-@@ -167,3 +173,21 @@ mod tests {
+@@ -52,17 +61,47 @@ pub fn entries(text: &str) -> Vec<Entry> {
+ }
+ 
+ /// Every entry of the phone's own table, read from wherever the table is.
+-fn table() -> Result<Vec<Entry>> {
+-    let mut out = Vec::new();
+-    for file in FILES {
+-        let text = match std::fs::read_to_string(file) {
+-            Ok(text) => text,
+-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+-            Err(e) => return Err(e).with_context(|| format!("read {file}")),
+-        };
+-        out.extend(entries(&text));
++fn live(files: &[&Path]) -> Result<String> {
++    let mut text = String::new();
++    for file in files {
++        match std::fs::read_to_string(file) {
++            Ok(part) => { text.push_str(&part); text.push('\n'); }
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
++        }
+     }
+-    Ok(out)
++    Ok(text)
++}
++
++fn read_table(files: &[&Path], snapshot: &Path) -> Result<Vec<Entry>> {
++    match std::fs::read_to_string(snapshot) {
++        Ok(text) if !entries(&text).is_empty() => return Ok(entries(&text)),
++        Ok(_) => {}
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++        Err(e) => return Err(e).with_context(|| format!("read {}", snapshot.display())),
++    }
++    Ok(entries(&live(files)?))
++}
++
++fn save_table(files: &[&Path], snapshot: &Path) -> Result<usize> {
++    let text = live(files)?;
++    let count = entries(&text).len();
++    if count == 0 { return Ok(0); }
++    if let Some(parent) = snapshot.parent() { std::fs::create_dir_all(parent)?; }
++    let pending = snapshot.with_extension("part");
++    std::fs::write(&pending, text)?;
++    std::fs::rename(pending, snapshot)?;
++    Ok(count)
++}
++
++/// Preserve the mounted system's table in the recovery ramdisk before any detach.
++/// A missing live table never replaces a previously captured table.
++pub fn cache() -> Result<usize> {
++    save_table(&FILES.map(Path::new), Path::new(SNAPSHOT))
++}
++
++fn table() -> Result<Vec<Entry>> {
++    read_table(&FILES.map(Path::new), Path::new(SNAPSHOT))
+ }
+ 
+ /// What the phone's own table says about `mount_point`.
+@@ -118,6 +157,22 @@ pub fn mount(name: &str) -> Result<PathBuf> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn the_captured_table_survives_vendor_detach_and_an_empty_refresh() {
++        let dir = std::env::temp_dir().join(format!("skyward-fstab-cache-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let vendor = dir.join("fstab.qcom");
++        let snapshot = dir.join("run/fstab.snapshot");
++        std::fs::write(&vendor, TABLE).unwrap();
++        assert_eq!(save_table(&[&vendor], &snapshot).unwrap(), 3);
++        std::fs::remove_file(&vendor).unwrap();
++        assert_eq!(save_table(&[&vendor], &snapshot).unwrap(), 0);
++        let captured = read_table(&[&vendor], &snapshot).unwrap();
++        assert_eq!(captured, entries(TABLE));
++        assert_eq!(captured.iter().filter(|entry| entry.mount_point == "/data").count(), 2);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
+     const TABLE: &str = "\
+ # a comment
+ /dev/block/bootdevice/by-name/metadata /metadata f2fs noatime,nosuid wait,check,formattable
+@@ -167,3 +222,21 @@ mod tests {
          assert_eq!(entries(TABLE).len(), 3);
      }
  }
@@ -123,10 +214,38 @@ index f75cbad..c03d54b 100644
 +    }
 +}
 diff --git a/crates/skyward-block/src/loopdev.rs b/crates/skyward-block/src/loopdev.rs
-index ab782de..dc45d45 100644
+index ab782de..f08e039 100644
 --- a/crates/skyward-block/src/loopdev.rs
 +++ b/crates/skyward-block/src/loopdev.rs
-@@ -15,6 +15,9 @@ mod android {
+@@ -1,6 +1,27 @@
+ //! Making a block device out of part of a file, which is how the bundles a
+ //! phone keeps its shared libraries in are opened.
+ 
++/// Copy a bundle's payload into recovery memory before making a loop device.
++/// The original partition can then be released without leaving a backing file open.
++pub fn copy_backing(file: &std::path::Path, to: &std::path::Path, offset: u64, length: u64) -> anyhow::Result<()> {
++    use anyhow::{Context, ensure};
++    use std::io::{Read, Seek, SeekFrom};
++    ensure!(length > 0, "empty loop backing image");
++    let mut source = std::fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
++    source.seek(SeekFrom::Start(offset)).context("seek to the bundle payload")?;
++    let pending = to.with_extension("part");
++    let copied = (|| -> anyhow::Result<()> {
++        let mut target = std::fs::File::create(&pending).with_context(|| format!("create {}", pending.display()))?;
++        let n = std::io::copy(&mut source.take(length), &mut target).context("copy the bundle payload into recovery memory")?;
++        ensure!(n == length, "bundle payload ended after {n} of {length} bytes");
++        drop(target);
++        std::fs::rename(&pending, to).with_context(|| format!("keep {}", to.display()))?;
++        Ok(())
++    })();
++    if copied.is_err() { let _ = std::fs::remove_file(&pending); }
++    copied
++}
++
+ #[cfg(target_os = "android")]
+ pub use android::*;
+ 
+@@ -15,6 +36,9 @@ mod android {
  
      const GET_FREE: u32 = 0x4C82;
      const CONFIGURE: u32 = 0x4C0A;
@@ -136,7 +255,7 @@ index ab782de..dc45d45 100644
  
      /// The device only ever reads. It stays pointed at the file until the
      /// recovery ends, which is as long as anything mounted from it lasts.
-@@ -48,8 +51,7 @@ mod android {
+@@ -48,8 +72,7 @@ mod android {
      }
  
      /// Open `file` from `offset` for `length` bytes as a block device, and
@@ -146,7 +265,7 @@ index ab782de..dc45d45 100644
      pub fn attach(file: &Path, offset: u64, length: u64) -> Result<PathBuf> {
          let backing = File::open(file).with_context(|| format!("open {}", file.display()))?;
          let control = File::open(CONTROL).with_context(|| format!("open {CONTROL}"))?;
-@@ -69,7 +71,22 @@ mod android {
+@@ -69,7 +92,22 @@ mod android {
          config.info.size_limit = length;
          config.info.flags = READ_ONLY;
          if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
@@ -170,6 +289,29 @@ index ab782de..dc45d45 100644
          }
          Ok(path)
      }
+@@ -86,3 +124,22 @@ mod android {
+         anyhow::bail!("the kernel handed out loop device {number}, which is in neither /dev/block nor /dev")
+     }
+ }
++
++#[cfg(test)]
++mod backing_tests {
++    use super::copy_backing;
++    #[test]
++    fn a_ram_backing_contains_only_the_payload_and_survives_a_short_source() {
++        let dir = std::env::temp_dir().join(format!("skyward-loop-backing-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let from = dir.join("bundle");
++        let to = dir.join("payload.img");
++        std::fs::write(&from, b"headerPAYLOADtrailer").unwrap();
++        copy_backing(&from, &to, 6, 7).unwrap();
++        assert_eq!(std::fs::read(&to).unwrap(), b"PAYLOAD");
++        assert!(copy_backing(&from, &to, 6, 100).is_err());
++        assert_eq!(std::fs::read(&to).unwrap(), b"PAYLOAD");
++        assert!(!to.with_extension("part").exists());
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++}
 diff --git a/crates/skyward-bootimg/Cargo.toml b/crates/skyward-bootimg/Cargo.toml
 index c34a04d..87e915f 100644
 --- a/crates/skyward-bootimg/Cargo.toml
@@ -3609,7 +3751,7 @@ index f4b7775..ac4bff2 100644
  
  /// The phone as the partitions of the slot's installed system describe it,
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index c770fe4..c5163ee 100644
+index c770fe4..fccd974 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
 @@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
@@ -3738,8 +3880,18 @@ index c770fe4..c5163ee 100644
      if names.is_empty() {
          return Ok(());
      }
+@@ -841,6 +886,9 @@ fn recovery() -> Result<()> {
+ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_config::Service>> {
+     match skyward_vab::mount_partitions(slot) {
+         Ok(mounts) => {
++            if let Err(e) = skyward_block::fstab::cache() {
++                skyward_sys::kmsg(&format!("the filesystem table could not be kept: {e:#}"))?;
++            }
+             for d in &mounts.damaged {
+                 skyward_sys::kmsg(&format!("super: {d}"))?;
+             }
 diff --git a/crates/skyward/src/secure.rs b/crates/skyward/src/secure.rs
-index deefa91..85f76a1 100644
+index deefa91..21fe7c5 100644
 --- a/crates/skyward/src/secure.rs
 +++ b/crates/skyward/src/secure.rs
 @@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
@@ -3766,6 +3918,96 @@ index deefa91..85f76a1 100644
          let (package, rest) = name
              .split_once('@')
              .with_context(|| format!("{name} does not read as a hardware service's name"))?;
+@@ -175,7 +182,12 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
+         return Ok(None);
+     };
+     let (offset, length) = image(&file)?;
+-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
++    let copied = Path::new("/skyward/run/apex").join(format!("{name}.img"));
++    fs::create_dir_all(copied.parent().expect("a recovery bundle directory"))?;
++    if !copied.metadata().is_ok_and(|m| m.len() == length) {
++        skyward_block::loopdev::copy_backing(&file, &copied, offset, length)?;
++    }
++    let device = skyward_block::loopdev::attach(&copied, 0, length)?;
+     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+     skyward_block::mount::mount_ro(&device, &at)?;
+     Ok(Some(at))
+diff --git a/crates/skyward/src/services.rs b/crates/skyward/src/services.rs
+index 52b8d47..843977d 100644
+--- a/crates/skyward/src/services.rs
++++ b/crates/skyward/src/services.rs
+@@ -1,5 +1,6 @@
+ use anyhow::{bail, ensure, Context, Result};
+-use procfs::process::{FDTarget, MMapPath, Process};
++use procfs::process::{all_processes, FDTarget, MMapPath, Process};
++use procfs::{ProcError, ProcResult};
+ use skyward_config::Service;
+ use skyward_programs::script::{Socket, SocketKind};
+ use skyward_programs::secure::Started;
+@@ -432,27 +433,35 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
+ /// locked mappings stay for the rest of the recovery's life.
+ pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
+     let mut files = BTreeSet::new();
+-    // A program run once has ended, and one between restarts has nothing in
+-    // memory to keep either.
+-    for s in services.iter().filter(|s| !s.oneshot) {
+-        let Some(pid) = running(&s.path) else { continue };
+-        let process = Process::new(pid as i32).with_context(|| format!("open process {pid}"))?;
+-        for map in process.maps().with_context(|| format!("read the mappings of {}", s.path))? {
+-            if let MMapPath::Path(p) = map.pathname {
+-                files.insert(p);
++    // Dynamically started programs, including wpa_supplicant and init's
++    // service directories, hold partitions just as the configured programs do.
++    let mut pids: BTreeSet<i32> = services.iter().filter(|s| !s.oneshot)
++        .filter_map(|s| running(&s.path).map(|pid| pid as i32)).collect();
++    for process in all_processes().context("list programs before detaching partitions")? {
++        if let Some(process) = present_for_pin(process)? { pids.insert(process.pid()); }
++    }
++    for pid in pids {
++        let Some(process) = present_for_pin(Process::new(pid))? else { continue };
++        if let Some(maps) = present_for_pin(process.maps())? {
++            for map in maps {
++                if let MMapPath::Path(p) = map.pathname { files.insert(p); }
+             }
+         }
+-        for fd in process.fd().with_context(|| format!("read the files {} has open", s.path))? {
+-            if let FDTarget::Path(p) = fd.with_context(|| format!("read a file {} has open", s.path))?.target {
+-                files.insert(p);
++        if let Some(fds) = present_for_pin(process.fd())? {
++            for fd in fds {
++                if let Some(fd) = present_for_pin(fd)?
++                    && let FDTarget::Path(p) = fd.target { files.insert(p); }
+             }
+         }
+     }
+     let mut busy: Vec<PathBuf> = Vec::new();
+     for file in files {
+         let Some(m) = mounted.iter().find(|m| file.starts_with(&m.mount_point)) else { continue };
+-        if !fs::metadata(&file).with_context(|| format!("stat {}", file.display()))?.is_file() {
+-            continue;
++        match fs::metadata(&file) {
++            Ok(metadata) if metadata.is_file() => {}
++            Ok(_) => continue,
++            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
++            Err(e) => return Err(e).with_context(|| format!("stat {}", file.display())),
+         }
+         lock(&file)?;
+         let _ = skyward_sys::kmsg(&format!("kept {} in memory", file.display()));
+@@ -463,6 +472,14 @@ pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
+     Ok(busy)
+ }
+ 
++fn present_for_pin<T>(result: ProcResult<T>) -> Result<Option<T>> {
++    match result {
++        Ok(value) => Ok(Some(value)),
++        Err(ProcError::NotFound(_)) => Ok(None),
++        Err(error) => Err(error.into()),
++    }
++}
++
+ /// Map `path` whole and lock the mapping: its pages then stay in memory
+ /// for every process that maps the file.
+ fn lock(path: &Path) -> Result<()> {
 diff --git a/crates/skyward/src/settings.rs b/crates/skyward/src/settings.rs
 index ad36bfb..245743d 100644
 --- a/crates/skyward/src/settings.rs
@@ -3796,7 +4038,7 @@ index ad36bfb..245743d 100644
      file.sync_all().with_context(|| format!("write {WRITING}"))?;
      fs::rename(WRITING, FILE).with_context(|| format!("move {WRITING} over {FILE}"))?;
 diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
-index 8ed3ceb..f0cda49 100644
+index 8ed3ceb..dec9e7a 100644
 --- a/crates/skyward/src/ui.rs
 +++ b/crates/skyward/src/ui.rs
 @@ -1,4 +1,5 @@
@@ -3922,7 +4164,15 @@ index 8ed3ceb..f0cda49 100644
  /// Leave recovery for the chosen target.
  fn power(target: Target) -> Result<()> {
      skyward_sys::power(match target {
-@@ -1216,6 +1249,7 @@ struct Pages<'a> {
+@@ -1000,6 +1033,7 @@ fn set_slot(slot: skyward_vab::Slot) -> Result<skyward_vab::BootSlots, String> {
+ fn detach(services: Vec<Service>) -> Detach {
+     Box::new(move || {
+         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
++        skyward_block::fstab::cache()?;
+         let mounted = skyward_vab::mounted_partitions(slot)?;
+         let busy = services::pin(&services, &mounted)?;
+         skyward_vab::release_partitions(slot, &busy)
+@@ -1216,6 +1250,7 @@ struct Pages<'a> {
      skyward_updater: Option<updates::Worker>,
      /// The terminal page's shell, from when the page first asks for one.
      shell: Option<pty::Shell>,
@@ -3930,7 +4180,7 @@ index 8ed3ceb..f0cda49 100644
      /// The USB drive plugged in, looked for each second.
      plugged: Option<Plugged>,
      seen: Option<String>,
-@@ -1275,6 +1309,7 @@ impl<'a> Pages<'a> {
+@@ -1275,6 +1310,7 @@ impl<'a> Pages<'a> {
          };
          let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
          app.set_screen_corners(cfg.display.corner_radius as f32);
@@ -3938,7 +4188,7 @@ index 8ed3ceb..f0cda49 100644
          // The settings kept from the starts before are back before the first
          // frame, and before file transfer starts with its switch and the time
          // zone. The pages speak the language chosen then, or else the one the
-@@ -1341,6 +1376,7 @@ impl<'a> Pages<'a> {
+@@ -1341,6 +1377,7 @@ impl<'a> Pages<'a> {
          let by_name = Path::new(skyward_block::BY_NAME);
          let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
          app.state.recovery_partitions = both("recovery")?;
@@ -3946,7 +4196,7 @@ index 8ed3ceb..f0cda49 100644
          app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
          // The second system's work; the systems are read at once, for the home
          // page to name the one that starts, once a switch cut off before is
-@@ -1365,6 +1401,9 @@ impl<'a> Pages<'a> {
+@@ -1365,6 +1402,9 @@ impl<'a> Pages<'a> {
                  app.report(&format!("{e:#}"), monotonic_ms());
              }
          }
@@ -3956,7 +4206,7 @@ index 8ed3ceb..f0cda49 100644
          Ok(Pages {
              cfg,
              programs,
-@@ -1414,7 +1453,7 @@ impl<'a> Pages<'a> {
+@@ -1414,7 +1454,7 @@ impl<'a> Pages<'a> {
              systems_worker,
              switch_asked: false,
              switched: false,
@@ -3965,7 +4215,7 @@ index 8ed3ceb..f0cda49 100644
              wlan: None,
              scanned_at: Instant::now(),
              checker: None,
-@@ -1422,6 +1461,7 @@ impl<'a> Pages<'a> {
+@@ -1422,6 +1462,7 @@ impl<'a> Pages<'a> {
              skyward_checker: None,
              skyward_updater: None,
              shell: None,
@@ -3973,7 +4223,7 @@ index 8ed3ceb..f0cda49 100644
              plugged: None,
              seen: None,
              drive_at: Instant::now(),
-@@ -1510,6 +1550,16 @@ impl<'a> Pages<'a> {
+@@ -1510,6 +1551,16 @@ impl<'a> Pages<'a> {
              }
              Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
          }
@@ -3990,7 +4240,7 @@ index 8ed3ceb..f0cda49 100644
          // A switch asked for finishes one cut off before itself; fastboot leaves
          // /metadata to fastbootd until the recovery's pages come up.
          if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
-@@ -1607,6 +1657,7 @@ impl<'a> Pages<'a> {
+@@ -1607,6 +1658,7 @@ impl<'a> Pages<'a> {
          self.skyward_told(now)?;
          self.decrypt_told(now)?;
          self.shell_told()?;
@@ -3998,7 +4248,7 @@ index 8ed3ceb..f0cda49 100644
          self.take_in(drive_told, now)?;
          self.offer_storage(now)
      }
-@@ -1631,6 +1682,73 @@ impl<'a> Pages<'a> {
+@@ -1631,6 +1683,73 @@ impl<'a> Pages<'a> {
          Ok(())
      }
  
@@ -4072,7 +4322,7 @@ index 8ed3ceb..f0cda49 100644
      /// One click of the motor, as strong as the settings say.
      fn click(&mut self) -> Result<()> {
          if let Some(h) = &mut self.haptics {
-@@ -1714,7 +1832,7 @@ impl<'a> Pages<'a> {
+@@ -1714,7 +1833,7 @@ impl<'a> Pages<'a> {
          // After the frame is on the panel, so a panel coming back on lights
          // with what it should show now, never with what it showed when it
          // went off.
@@ -4081,7 +4331,7 @@ index 8ed3ceb..f0cda49 100644
              self.surface.settle()?;
          }
          self.backlight.show(panel)?;
-@@ -1802,6 +1920,7 @@ impl<'a> Pages<'a> {
+@@ -1802,6 +1921,7 @@ impl<'a> Pages<'a> {
          if let Some(s) = &self.systems_worker {
              fds.push(s.fd());
          }
@@ -4089,7 +4339,7 @@ index 8ed3ceb..f0cda49 100644
          fds.push(self.readings.fd());
          wait(&fds, timeout)
      }
-@@ -1825,6 +1944,7 @@ impl<'a> Pages<'a> {
+@@ -1825,6 +1945,7 @@ impl<'a> Pages<'a> {
              || self.downloader.is_some()
              || self.skyward_checker.is_some()
              || self.skyward_updater.is_some()
@@ -4097,7 +4347,7 @@ index 8ed3ceb..f0cda49 100644
              || systems_busy;
          let joining = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
          let running = match &self.shell {
-@@ -2519,7 +2639,10 @@ impl Pages<'_> {
+@@ -2519,7 +2640,10 @@ impl Pages<'_> {
              }
              Effect::InstallPath(path) => {
                  if self.may_install(now)? {
@@ -4109,7 +4359,7 @@ index 8ed3ceb..f0cda49 100644
                  }
              }
              Effect::Flash { partition, pick } => {
-@@ -2599,6 +2722,7 @@ impl Pages<'_> {
+@@ -2599,6 +2723,7 @@ impl Pages<'_> {
                  skyward_sys::kmsg("merging the update, as the update page asked")?;
                  self.merger = Some(merge::Merger::start(slot, true)?);
              }
@@ -4117,7 +4367,7 @@ index 8ed3ceb..f0cda49 100644
              Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
              Effect::ScanWlan => {
                  self.scanned_at = Instant::now();
-@@ -2608,6 +2732,12 @@ impl Pages<'_> {
+@@ -2608,6 +2733,12 @@ impl Pages<'_> {
                  wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
              }
              Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
@@ -4130,6 +4380,21 @@ index 8ed3ceb..f0cda49 100644
              Effect::CheckUpdate => self.check_update()?,
              Effect::Download(release) => self.download(release, now)?,
              Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
+@@ -2700,7 +2831,13 @@ impl Pages<'_> {
+     /// internal storage go, which the page is told otherwise.
+     fn may_install(&mut self, now: u64) -> Result<bool> {
+         ensure!(self.installer.is_none(), "an installer is running already");
+-        withhold(&mut self.transfer, &mut self.app, now)
++        let ready = withhold(&mut self.transfer, &mut self.app, now)?;
++        if ready {
++            self.browser = None;
++            self.app.state.browser.running = false;
++            self.app.state.browser.frame = None;
++        }
++        Ok(ready)
+     }
+ 
+     /// Erase all user data, as the page the system's request showed asks.
 diff --git a/crates/skyward/src/updates.rs b/crates/skyward/src/updates.rs
 index b5f0dae..8628627 100644
 --- a/crates/skyward/src/updates.rs

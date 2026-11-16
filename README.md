@@ -83,6 +83,12 @@ fastboot boot skyward-nabu-boot.img
 
 Unencrypted internal storage opens automatically. Use **File manager** to browse the existing files. Maintainer details are under **Settings → About phone**. This release has been tested through temporary boot. Flashing, formatting and OTA installation have separate effects on the installed system and require their own validation.
 
+## ZIP installation
+
+Legacy ZIP installers can release the installed system's partitions while the recovery's hardware services continue from RAM-backed runtime bundles. The filesystem repair/format list retains its data and metadata entries after vendor is detached. The corresponding nabu installation has been confirmed with `nabu_XiaomiPad5_OS3.0.303.0.WNXCNXM_16.0.zip`.
+
+The filesystem repair/format page lists data, metadata and cache where present. nabu has no separate cache partition. Use **Mount** for the system partition mount controls.
+
 ## Install recovery into boot
 
 1. Temporarily boot the image with `fastboot boot skyward-nabu-boot.img`.

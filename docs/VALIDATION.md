@@ -34,3 +34,16 @@ rendering; media and WebGL are disabled. Its mount namespace, chroot and
 unprivileged UID run with WebKit's bubblewrap sandbox disabled. Credential-based
 FBE decryption and this release's browser download UI have not been validated
 across other ROMs.
+
+## v0.3.1-nabu.3
+
+The on-device legacy ZIP installation was confirmed working with
+`nabu_XiaomiPad5_OS3.0.303.0.WNXCNXM_16.0.zip` after the partition-release fix.
+The recovery stages APEX payloads in RAM, keeps files needed by running
+processes pinned, and retains a snapshot of the vendor/odm filesystem table.
+
+The targeted skyward-block checks passed (39 tests), including retaining the
+filesystem table after vendor disappears and preserving a complete RAM backing
+image when a source read is short. Android release compilation and Clippy with
+warnings denied completed successfully. The combined device patch reconstructs
+the source used to build the release image.
