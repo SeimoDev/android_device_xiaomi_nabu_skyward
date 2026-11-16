@@ -809,10 +809,10 @@ index 437d7dd..b09d2af 100644
  tempfile = "3.27.0"
 diff --git a/crates/skyward-install/src/boot.rs b/crates/skyward-install/src/boot.rs
 new file mode 100644
-index 0000000..02616d6
+index 0000000..4043497
 --- /dev/null
 +++ b/crates/skyward-install/src/boot.rs
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,221 @@
 +//! Installing recovery into a boot slot while retaining its kernel and
 +//! normal Android boot path. Every write follows a persistent boot backup.
 +use anyhow::{ensure, Context, Result};
@@ -824,6 +824,33 @@ index 0000000..02616d6
 +use std::path::{Path, PathBuf};
 +
 +pub const BACKUPS: &str = "/data/media/0/Skyward/boot-backups";
++
++/// The standalone installer reads the ramdisk's original files in its own
++/// mount namespace. Runtime vendor bindings stay in place for recovery and
++/// its hardware services, while the inventory is checked against the base.
++#[cfg(target_os = "android")]
++pub fn original_ramdisk_view() -> Result<()> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++    let inventory=match fs::read_to_string("/system/etc/skyward/vendor-runtime.files") {
++        Ok(text)=>text,
++        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
++        Err(e)=>return Err(e).context("read vendor runtime inventory"),
++    };
++    ensure!(unsafe {libc::unshare(libc::CLONE_NEWNS)}==0,"isolate boot installer mounts: {}",std::io::Error::last_os_error());
++    let root=c"/";
++    ensure!(unsafe {libc::mount(std::ptr::null(),root.as_ptr(),std::ptr::null(),libc::MS_REC|libc::MS_PRIVATE,std::ptr::null())}==0,"make boot installer mounts private: {}",std::io::Error::last_os_error());
++    for line in inventory.lines().filter(|line| !line.trim().is_empty()) {
++        let (_,target)=line.split_once('\t').context("invalid vendor runtime inventory")?;
++        let target=Path::new(target);
++        ensure!((target.starts_with("/system/lib64") || target.starts_with("/system/etc/firmware")) && target.components().all(|part| !matches!(part,std::path::Component::ParentDir)),"invalid vendor runtime target");
++        if skyward_block::mount::is_mount_point(target)? {
++            let path=CString::new(target.as_os_str().as_bytes())?;
++            ensure!(unsafe {libc::umount2(path.as_ptr(),libc::MNT_DETACH)}==0,"read original ramdisk file {}: {}",target.display(),std::io::Error::last_os_error());
++        }
++    }
++    Ok(())
++}
 +
 +/// Rebuild a slot's boot from its own header and kernel and the packaged
 +/// recovery ramdisk. The package is retained so installation can run again.
@@ -1835,7 +1862,7 @@ index cc4f55a..c0e1781 100644
  serde_json = "1.0.145"
 diff --git a/crates/skyward-pack/src/boot_installer.rs b/crates/skyward-pack/src/boot_installer.rs
 new file mode 100644
-index 0000000..67b90b8
+index 0000000..06b2bc2
 --- /dev/null
 +++ b/crates/skyward-pack/src/boot_installer.rs
 @@ -0,0 +1,42 @@
@@ -1846,7 +1873,7 @@ index 0000000..67b90b8
 +
 +const SCRIPT: &str = r#"#!/system/bin/sh
 +OUTFD="$2"
-+ui_print() { echo "ui_print $*" >&$OUTFD; echo "ui_print" >&$OUTFD; }
++ui_print() { echo "ui_print $*" >"/proc/self/fd/$OUTFD"; echo "ui_print" >"/proc/self/fd/$OUTFD"; }
 +ui_print "Install Skyward to the current boot slot"
 +ui_print "The original boot image is backed up before writing."
 +ln -sf /system/bin/recovery /tmp/skyward-install-cli || exit 1
@@ -4525,7 +4552,7 @@ index f4b7775..ac4bff2 100644
  
  /// The phone as the partitions of the slot's installed system describe it,
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index c770fe4..de16222 100644
+index c770fe4..41c2ee0 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
 @@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
@@ -4557,11 +4584,13 @@ index c770fe4..de16222 100644
      /// Print what the About page shows, plus a partition summary.
      Info {
          /// Device configuration, e.g. devices/nezha.toml.
-@@ -236,6 +251,22 @@ fn main() -> Result<()> {
+@@ -236,6 +251,24 @@ fn main() -> Result<()> {
          std::process::exit(code);
      }
      match Cli::parse().cmd {
 +        Cmd::InstallBoot { package, source, out, root } => {
++            #[cfg(target_os = "android")]
++            if root==Path::new("/") {skyward_install::boot::original_ramdisk_view()?;}
 +            if let Some(out) = out {
 +                let source = source.context("an offline preparation requires --source")?;
 +                let stock = std::fs::read(source)?;
@@ -4580,7 +4609,7 @@ index c770fe4..de16222 100644
          Cmd::Info { config } => info(&config),
          Cmd::Slot => slot(),
          Cmd::Modules { source } => modules(&source),
-@@ -534,7 +565,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -534,7 +567,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      // The drivers ask for their firmware by name, and the kernel looks only
      // in folders of its own unless told to pass on what it does not find
      // there to ueventd, which looks in the recovery's firmware folders.
@@ -4595,7 +4624,7 @@ index c770fe4..de16222 100644
      if let Some(firmware) = &cfg.firmware {
          mount_firmware(&firmware.partition)?;
      }
-@@ -551,16 +588,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -551,16 +590,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      }
      // What the phone describes is known wherever its partitions could be
      // read at all; what they say of its keys may still not be.
@@ -4619,7 +4648,7 @@ index c770fe4..de16222 100644
      if !hardware.is_empty() {
          secure::prepare_hardware_directory(&hardware)?;
          skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
-@@ -575,7 +615,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -575,7 +617,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
      if found.as_deref().is_ok_and(keys::serves_elements) {
          registering.push(skyward_omapi::SERVICE.to_string());
      }
@@ -4628,7 +4657,7 @@ index c770fe4..de16222 100644
      // A program may register more than the recovery waits for, as the
      // WLAN's supplicant registers its maker's own service beside
      // Android's, and ends where the directory turns one of them away. So
-@@ -597,7 +637,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
+@@ -597,7 +639,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
          skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
      }
      keys::start(&steps)?;
@@ -4639,7 +4668,7 @@ index c770fe4..de16222 100644
  }
  
  /// How long a file handed over may take to be there once the modules are
-@@ -667,9 +709,12 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
+@@ -667,9 +711,12 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
  /// credential service cannot write a note the key service will take, and
  /// the keys the phone guards behind a screen lock stay unusable.
  #[cfg(target_os = "android")]
@@ -4654,7 +4683,7 @@ index c770fe4..de16222 100644
      if names.is_empty() {
          return Ok(());
      }
-@@ -841,6 +886,11 @@ fn recovery() -> Result<()> {
+@@ -841,6 +888,11 @@ fn recovery() -> Result<()> {
  fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_config::Service>> {
      match skyward_vab::mount_partitions(slot) {
          Ok(mounts) => {

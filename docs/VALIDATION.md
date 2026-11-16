@@ -86,3 +86,17 @@ successful, and merge status None. The primary GPT header and entry checksums
 also matched. Targeted tests covered both 512-byte and 4096-byte sectors, A and B
 active flags, ambiguous flags and corrupted checksums. Android release compilation
 and Clippy with warnings denied passed.
+
+## v0.3.1-nabu.5 boot installer
+
+The installer reconstructed a boot image on the tablet while vendor runtime
+bindings were active. Inventory verification passed and the recovery's visible
+Keymaster library remained the installed ROM's version after the preparation
+process exited. Android release compilation and Clippy with warnings denied
+passed; the combined patch reconstructs the matching sources.
+
+The updated image was temporarily booted, and the user ran Install Skyward to
+boot after unlocking internal storage. The installer saved and verified the
+original boot backup, wrote boot_a, verified it by reading it back, and exited
+with status 0. Script status messages were visible, and the user confirmed
+installation succeeded.

@@ -52,3 +52,7 @@ Runtime resources are normalized for the unprivileged browser user: the chroot r
 ## Boot Control 1.1
 
 Boot control discovery accepts HIDL 1.1 as well as 1.2 and AIDL. With the Qualcomm 1.1 implementation, bootable/successful flags and slot switching use its HIDL methods. The next active slot is read from the boot partitions’ Qualcomm GPT attributes, with primary-header and partition-table CRC checks. This preserves the distinction between the booted slot and the next active slot.
+
+## Boot installer runtime view
+
+The standalone boot installer uses a private mount namespace to uncover the original ramdisk files beneath vendor runtime bindings. The packaged file inventory remains verified against the build, and recovery hardware services retain their installed-ROM libraries. Script status output uses `/proc/self/fd` so the recovery shell can write to descriptors above 9.
